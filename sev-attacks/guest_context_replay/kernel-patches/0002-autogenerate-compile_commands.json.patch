@@ -1,0 +1,24 @@
+From cc97f9abf6e1d7f756f39d67653c15ce68318ae9 Mon Sep 17 00:00:00 2001
+From: Luca Wilke <l.wilke@uni-luebeck.de>
+Date: Tue, 2 Apr 2024 07:59:01 +0200
+Subject: [PATCH 2/4] autogenerate compile_commands.json
+
+---
+ my-build.sh | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/my-build.sh b/my-build.sh
+index 7e7910d22bb5..78e1bf5958b3 100755
+--- a/my-build.sh
++++ b/my-build.sh
+@@ -15,6 +15,7 @@ make -j $(nproc) LOCALVERSION=${EV} scripts
+ make -j $(nproc) LOCALVERSION=${EV} prepare
+ make -j $(nproc) LOCALVERSION=${EV} modules_prepare
+ make -j $(nproc) LOCALVERSION=${EV} M=arch/x86/kvm
++./scripts/clang-tools/gen_compile_commands.py 
+ sudo make LOCALVERSION=${EV} M=arch/x86/kvm modules_install
+ 
+ #This will only export/install the headers meant for usage by userspace
+-- 
+2.34.1
+

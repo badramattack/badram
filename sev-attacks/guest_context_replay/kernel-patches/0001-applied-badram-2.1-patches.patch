@@ -1,0 +1,913 @@
+From aadd885469f3b8cbc66553fa7c120388adf8457d Mon Sep 17 00:00:00 2001
+From: Luca Wilke <l.wilke@uni-luebeck.de>
+Date: Sat, 9 Mar 2024 08:33:14 +0100
+Subject: [PATCH 1/4] applied badram 2.1 patches
+
+---
+ arch/x86/include/asm/kvm_host.h  |   3 +
+ arch/x86/kvm/Makefile            |   2 +-
+ arch/x86/kvm/badram.c            |  22 +++
+ arch/x86/kvm/mmu/mmu.c           |  45 ++++-
+ arch/x86/kvm/svm/svm.c           | 129 ++++++++++++-
+ drivers/crypto/ccp/sev-dev.c     |   8 +
+ drivers/crypto/ccp/sev-dev.c.rej |  24 +++
+ include/linux/badram.h           |  48 +++++
+ include/uapi/linux/kvm.h         |  57 ++++++
+ my-build.sh                      |  38 ++++
+ virt/kvm/kvm_main.c              | 315 +++++++++++++++++++++++++++++++
+ 11 files changed, 685 insertions(+), 6 deletions(-)
+ create mode 100644 arch/x86/kvm/badram.c
+ create mode 100644 drivers/crypto/ccp/sev-dev.c.rej
+ create mode 100644 include/linux/badram.h
+ create mode 100755 my-build.sh
+
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 4df86a4ac458..ed0f87997dbb 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -2106,6 +2106,9 @@ int kvm_get_nr_pending_nmis(struct kvm_vcpu *vcpu);
+ void kvm_update_dr7(struct kvm_vcpu *vcpu);
+ 
+ int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn);
++
++int badram_get_spte(struct kvm_vcpu* vcpu, gpa_t gpa, u8 goal_level, uint64_t* out_spte);
++int direct_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
+ void kvm_mmu_free_roots(struct kvm *kvm, struct kvm_mmu *mmu,
+ 			ulong roots_to_free);
+ void kvm_mmu_free_guest_mode_roots(struct kvm *kvm, struct kvm_mmu *mmu);
+diff --git a/arch/x86/kvm/Makefile b/arch/x86/kvm/Makefile
+index 475b5fa917a6..fc8e63a0fb34 100644
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -12,7 +12,7 @@ include $(srctree)/virt/kvm/Makefile.kvm
+ kvm-y			+= x86.o emulate.o i8259.o irq.o lapic.o \
+ 			   i8254.o ioapic.o irq_comm.o cpuid.o pmu.o mtrr.o \
+ 			   debugfs.o mmu/mmu.o mmu/page_track.o \
+-			   mmu/spte.o
++			   mmu/spte.o badram.o
+ 
+ kvm-$(CONFIG_X86_64) += mmu/tdp_iter.o mmu/tdp_mmu.o
+ kvm-$(CONFIG_KVM_HYPERV) += hyperv.o
+diff --git a/arch/x86/kvm/badram.c b/arch/x86/kvm/badram.c
+new file mode 100644
+index 000000000000..0b9f0b636d3a
+--- /dev/null
++++ b/arch/x86/kvm/badram.c
+@@ -0,0 +1,22 @@
++#include "linux/badram.h"
++#include "linux/export.h"
++#include "linux/spinlock_types.h"
++
++
++DEFINE_SPINLOCK(badram_remap_req_lock);
++EXPORT_SYMBOL(badram_remap_req_lock);
++
++badram_remap_request_t badram_remap_req = {
++  //this marks the rest of the content as invalid
++  .pending = false,
++};
++EXPORT_SYMBOL(badram_remap_req);
++
++badram_pause_vm_t badram_pause_vm = {
++  .target_kvm = NULL,
++  .status = BPV_INVALID,
++};
++EXPORT_SYMBOL(badram_pause_vm);
++DEFINE_SPINLOCK(badram_pause_vm_lock);
++EXPORT_SYMBOL(badram_pause_vm_lock);
++
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index c379bc92d07f..21d916d446eb 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -3235,8 +3235,46 @@ void disallowed_hugepage_adjust(struct kvm_page_fault *fault, u64 spte, int cur_
+ 	}
+ }
+ 
+-static int direct_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+-{
++
++/**
++ * @brief Lookup page table entry for gpa at the given page table level
++ * @param gpa : address for which we want the pt entry
++ * @param goal_level : page table level at which we stop the walk
++ * @pram out_spte : output paramter filled with the resulting page table entry
++ * @return 0 on success
++*/
++int badram_get_spte(struct kvm_vcpu* vcpu, gpa_t gpa, u8 goal_level, uint64_t* out_spte) {
++	
++	struct kvm_shadow_walk_iterator it;
++	struct kvm_mmu_page *sp;
++	gfn_t base_gfn = gpa >> PAGE_SHIFT;
++
++	//walk gpa->hpa page tables. based on implementation in direct_map
++	for_each_shadow_entry(vcpu, gpa, it) {
++
++		base_gfn = gfn_round_for_level(gpa >> PAGE_SHIFT, it.level);
++		if (it.level == goal_level)
++			break;
++
++		sp = kvm_mmu_get_child_sp(vcpu, it.sptep, base_gfn, true, ACC_ALL);
++		if (sp == ERR_PTR(-EEXIST))
++			continue;
++
++		link_shadow_page(vcpu, it.sptep, sp);
++	}
++
++	if (WARN_ON_ONCE(it.level != goal_level)) {
++		return -EFAULT;
++	}
++
++	//it.sptep is pointer to page table entry -> read it
++	*out_spte = __get_spte_lockless(it.sptep);
++
++	return 0;
++}
++EXPORT_SYMBOL(badram_get_spte);
++
++int direct_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault) {
+ 	struct kvm_shadow_walk_iterator it;
+ 	struct kvm_mmu_page *sp;
+ 	int ret;
+@@ -3278,6 +3316,7 @@ static int direct_map(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+ 	direct_pte_prefetch(vcpu, it.sptep);
+ 	return ret;
+ }
++EXPORT_SYMBOL(direct_map);
+ 
+ static void kvm_send_hwpoison_signal(struct kvm_memory_slot *slot, gfn_t gfn)
+ {
+@@ -4614,7 +4653,7 @@ int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault)
+ 	}
+ 
+ #ifdef CONFIG_X86_64
+-	if (tdp_mmu_enabled)
++	if (tdp_mmu_enabled) 
+ 		return kvm_tdp_mmu_page_fault(vcpu, fault);
+ #endif
+ 
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index b2832c381d42..4e7a2bf283d2 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1,5 +1,8 @@
+ #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
++#include "asm/kvm_host.h"
++#include "asm/pgtable_types.h"
+ 
++#include "mmu/mmu_internal.h"
+ #include <linux/kvm_host.h>
+ 
+ #include "irq.h"
+@@ -52,6 +55,8 @@
+ #include "kvm_onhyperv.h"
+ #include "svm_onhyperv.h"
+ 
++#include "linux/badram.h"
++
+ MODULE_AUTHOR("Qumranet");
+ MODULE_LICENSE("GPL");
+ 
+@@ -1470,6 +1475,7 @@ static int svm_vcpu_create(struct kvm_vcpu *vcpu)
+ 		 * address since hardware will access it using the guest key.
+ 		 */
+ 		svm->sev_es.vmsa_pa = __pa(svm->sev_es.vmsa);
++		printk("%s:%d %s svm->sev_es.vmsa_pa 0x%llx\n", __FILE__, __LINE__, __FUNCTION__, svm->sev_es.vmsa_pa);
+ 	}
+ 
+ 	svm->guest_state_loaded = false;
+@@ -3510,11 +3516,73 @@ static void svm_get_exit_info(struct kvm_vcpu *vcpu, u32 *reason,
+ 		*error_code = 0;
+ }
+ 
++
++/**
++ * @brief Changes an NPT mapping
++ * Implicitly references the badram_remap_req variable
++ * from linux/badram.h. Expects to be called witht he
++ * badramp_remap_req_lock
++ * @returns RET_PF_{...} enum value of direct_map. 4 means page fault fixed/success
++*/
++static int badram_remap_gfns(struct kvm_vcpu* vcpu) {
++	/*
++	 * //see https://elixir.bootlin.com/linux/latest/source/arch/x86/kvm/mmu/mmu_internal.h#L292
++	 * for a code location that constructs a kvm_page_fault struct
++
++	 * kvm_page_fault is documented in 
++	 * https://elixir.bootlin.com/linux/latest/source/arch/x86/kvm/mmu/mmu_internal.h#L189
++	*/
++
++	int idx;
++	//our fake page fault will use "not present" as its error code
++	u32 ec = PFERR_PRESENT_BIT;
++	int ret;
++	for(idx = 0; idx < sizeof(badram_remap_req.gfns)/sizeof(badram_remap_req.gfns[0]); idx++) {
++		
++		struct kvm_page_fault fault = {
++			.addr = badram_remap_req.gfns[idx] << PAGE_SHIFT ,
++			.error_code = ec, //defined in include/asm/kvm_host.h
++			.exec = ec & PFERR_FETCH_MASK,
++			.write = ec & PFERR_WRITE_MASK,
++			.present = ec & PFERR_PRESENT_MASK,
++			.rsvd = ec & PFERR_RSVD_MASK,
++			.user = ec & PFERR_USER_MASK,
++			.is_tdp =  badram_remap_req.is_tdp,
++			.nx_huge_page_workaround_enabled = badram_remap_req.have_hp_nx_workaround,
++			.huge_page_disallowed = false, // RMP uses 2MB pages by default
++			.max_level = PG_LEVEL_2M, // include/asm/pgtable_types.h
++			.req_level = PG_LEVEL_2M,
++			.goal_level = PG_LEVEL_2M,
++			.gfn = badram_remap_req.gfns[idx],
++			.slot =badram_remap_req.slots[idx],
++			//.mmu_seq = 0, //Not initialized by reference code
++			.pfn = badram_remap_req.new_pfns[idx],
++			//.hva =, //not initialized by reference code
++			.map_writable = true, //not sure
++			.write_fault_to_shadow_pgtable = true, //not sure
++		};
++
++		printk("%s:%d direct_map  gfn 0x%llx to pfn 0x%llx\n",
++				__FILE__, __LINE__, fault.gfn, fault.pfn);
++		ret = direct_map(vcpu, &fault);
++			//RET_PF_FIXED (=4) should indicate success. See mmu_internal.h for other values
++		if( RET_PF_FIXED != ret ) {
++			printk("%s:%d direct_map for gfn 0x%llx to pfn 0x%llx failed with %d\n",
++				__FILE__, __LINE__, fault.gfn, fault.pfn, ret);
++			return ret;
++		}
++	}
++	return ret;
++		
++}
++
+ static int svm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	struct kvm_run *kvm_run = vcpu->run;
+ 	u32 exit_code = svm->vmcb->control.exit_code;
++	int rc;
++	int invoked_badram = 0;
+ 
+ 	/* SEV-ES guests must use the CR write traps to track CR registers. */
+ 	if (!sev_es_guest(vcpu->kvm)) {
+@@ -3547,10 +3615,60 @@ static int svm_handle_exit(struct kvm_vcpu *vcpu, fastpath_t exit_fastpath)
+ 		return 0;
+ 	}
+ 
+-	if (exit_fastpath != EXIT_FASTPATH_NONE)
++
++	spin_lock(&badram_remap_req_lock);
++	if( badram_remap_req.pending && (vcpu->kvm == badram_remap_req.target_kvm)) {
++		int res;
++		invoked_badram = 1;
++		printk("%s:%d about to call badram_remap_gfns, current exit_code = %x\n", __FILE__, __LINE__, exit_code);
++		write_lock(&vcpu->kvm->mmu_lock);
++		if( (res = badram_remap_gfns(vcpu)) != RET_PF_FIXED) {
++			pr_err("%s:%d badram_remap_gfns failed with %d", __FILE__, __LINE__, res);
++		} else {
++			printk("%s:%d badram_reamp_gfns succeeded!\n", __FILE__, __LINE__);
++		}
++		write_unlock(&vcpu->kvm->mmu_lock);
++		//TODO: report status and success via IOCTLs
++		badram_remap_req.pending = false;
++		//should be done by direct_map but better safe than sorry
++		kvm_service_local_tlb_flush_requests(vcpu);
++		if( exit_code == SVM_EXIT_NPF ) {
++			printk("%s:%d badram_remap_gfns called as part of NPF exit, let cpu retry on original fault\n", __FILE__, __LINE__);
++			spin_unlock(&badram_remap_req_lock);
++			return RET_PF_RETRY;
++		}
++	}
++	spin_unlock(&badram_remap_req_lock);
++
++	spin_lock(&badram_pause_vm_lock);
++	if( (badram_pause_vm.target_kvm == vcpu->kvm )&& (badram_pause_vm.status == BPV_PAUSE_REQUESTED)) {
++		badram_pause_vm.status =  BPV_PAUSED;
++		printk("%s:%d %s : acking pause requeted, waiting for resume request...\n", __FILE__, __LINE__, __FUNCTION__);
++		//busy wait
++		spin_unlock(&badram_pause_vm_lock);
++		while(1) {
++			spin_lock(&badram_pause_vm_lock);
++			if(badram_pause_vm.status == BPV_RESUME_REQUESTED) {
++				spin_unlock(&badram_pause_vm_lock);
++				printk("%s:%d %s saw resume request, continuing exit handling\n", __FILE__, __LINE__, __FUNCTION__);
++				//N.B. we only update status to BPV_RESUMED, in the VM enter code
++				break;
++			}
++			spin_unlock(&badram_pause_vm_lock);
++		}
++	} else {
++		spin_unlock(&badram_pause_vm_lock);
++	}
++
++	
++	if (exit_fastpath != EXIT_FASTPATH_NONE) {
++		if(invoked_badram) printk("%s:%d returning from exit handler (fastpath)\n", __FILE__, __LINE__);
+ 		return 1;
++	}
+ 
+-	return svm_invoke_exit_handler(vcpu, exit_code);
++	rc = svm_invoke_exit_handler(vcpu, exit_code);
++	if(invoked_badram) printk("%s:%d returning from exit handler with rc %d", __FILE__, __LINE__, rc);
++	return rc;
+ }
+ 
+ static void pre_svm_run(struct kvm_vcpu *vcpu)
+@@ -4143,6 +4261,13 @@ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 	struct vcpu_svm *svm = to_svm(vcpu);
+ 	bool spec_ctrl_intercepted = msr_write_intercepted(vcpu, MSR_IA32_SPEC_CTRL);
+ 
++	spin_lock(&badram_pause_vm_lock);
++	if((badram_pause_vm.target_kvm == vcpu->kvm) && (badram_pause_vm.status == BPV_RESUME_REQUESTED)) {
++		printk("%s:%d %s : updating state to resumed\n", __FILE__, __LINE__, __FUNCTION__ );
++		badram_pause_vm.status = BPV_RESUMED;
++	}
++	spin_unlock(&badram_pause_vm_lock);
++
+ 	trace_kvm_entry(vcpu);
+ 
+ 	svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
+diff --git a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c
+index f1ee0f83f613..d47e6b10f5df 100644
+--- a/drivers/crypto/ccp/sev-dev.c
++++ b/drivers/crypto/ccp/sev-dev.c
+@@ -1011,6 +1011,7 @@ static int __sev_init_locked(int *error)
+ 
+ 		data.flags |= SEV_INIT_FLAGS_SEV_ES;
+ 		data.tmr_len = sev_es_tmr_size;
++		printk("%s:%d %s : tmr_address=0x%llx tmr_len=0x%x\n", __FILE__, __LINE__, __FUNCTION__, data.tmr_address, data.tmr_len);
+ 	}
+ 
+ 	return __sev_do_cmd_locked(SEV_CMD_INIT, &data, error);
+@@ -1034,6 +1035,7 @@ static int __sev_init_ex_locked(int *error)
+ 
+ 		data.flags |= SEV_INIT_FLAGS_SEV_ES;
+ 		data.tmr_len = sev_es_tmr_size;
++		printk("%s:%d %s : tmr_address=0x%llx tmr_len=0x%x\n", __FILE__, __LINE__, __FUNCTION__, data.tmr_address, data.tmr_len);
+ 	}
+ 
+ 	return __sev_do_cmd_locked(SEV_CMD_INIT_EX, &data, error);
+@@ -1177,7 +1179,12 @@ static int __sev_snp_init_locked(int *error)
+ 	sev->snp_initialized = true;
+ 	dev_dbg(sev->dev, "SEV-SNP firmware initialized\n");
+ 
++	//luca: this function is called before the other tmr related functions
++	//Thus is seems plausible that we indeed just fix the size value here and
++	//that the memory address is not yet valid/allocated
+ 	sev_es_tmr_size = SNP_TMR_SIZE;
++	printk("%s:%d %s : tmr_address=0x%lx tmr_len=0x%lx\n",
++			__FILE__, __LINE__, __FUNCTION__, __pa(sev_es_tmr), sev_es_tmr_size);
+ 
+ 	return rc;
+ }
+@@ -1244,6 +1251,7 @@ static int __sev_platform_init_locked(int *error)
+ {
+ 	int rc, psp_ret = SEV_RET_NO_FW_CALL;
+ 	struct sev_device *sev;
++	printk("%s:%d %s\n", __FILE__, __LINE__, __FUNCTION__);
+ 
+ 	if (!psp_master || !psp_master->sev_data)
+ 		return -ENODEV;
+diff --git a/drivers/crypto/ccp/sev-dev.c.rej b/drivers/crypto/ccp/sev-dev.c.rej
+new file mode 100644
+index 000000000000..e028139cbd15
+--- /dev/null
++++ b/drivers/crypto/ccp/sev-dev.c.rej
+@@ -0,0 +1,24 @@
++diff a/drivers/crypto/ccp/sev-dev.c b/drivers/crypto/ccp/sev-dev.c	(rejected hunks)
++@@ -1234,6 +1242,9 @@ static int __sev_platform_init_locked(int *error)
++ 		return 0;
++ 
++ 	if (!sev_es_tmr) {
+++	printk("%s:%d %s : Allocating 0x%jx bytes for sev_es_tmr\n",
+++			__FILE__, __LINE__, __FUNCTION__, sev_es_tmr_size);
+++
++ 		/* Obtain the TMR memory area for SEV-ES use */
++ 		sev_es_tmr = sev_fw_alloc(sev_es_tmr_size);
++ 		if (sev_es_tmr) {
++@@ -2302,10 +2313,11 @@ int sev_dev_init(struct psp_device *psp)
++ static void __sev_firmware_shutdown(struct sev_device *sev, bool in_panic)
++ {
++ 	int error;
++-
+++	printk("%s:%d %s\n", __FILE__, __LINE__, __FUNCTION__);
++ 	__sev_platform_shutdown_locked(NULL);
++ 
++ 	if (sev_es_tmr) {
+++		printk("%s:%d %s freeing sev_es_tmr\n", __FILE__, __LINE__, __FUNCTION__);
++ 		/*
++ 		 * The TMR area was encrypted, flush it from the cache
++ 		 *
+diff --git a/include/linux/badram.h b/include/linux/badram.h
+new file mode 100644
+index 000000000000..ea88b692a91c
+--- /dev/null
++++ b/include/linux/badram.h
+@@ -0,0 +1,48 @@
++#ifndef BADRAM_H
++#define BADRAM_H
++
++#include "linux/kvm_host.h"
++#include <linux/spinlock_types.h>
++#include <linux/types.h>
++
++
++typedef struct {
++	//specifies which npt entries we want to change
++	uint64_t gfns[2];
++	//new host pfn to which the corresponding gfn entry should point
++	uint64_t new_pfns[2];
++	//this identifies the VM for which we want to do the remapping
++	struct kvm* target_kvm;
++	//if tdp subsystem is enabled
++	bool is_tdp;
++	bool have_hp_nx_workaround;
++	//memory slot for gfn, required by remapping code
++	struct kvm_memory_slot* slots[2];
++	//if true, this struct contain valid
++	//data and we want this remap to happen on the next
++	//exit. Once completed, pending is reset to false 
++	bool pending;
++} badram_remap_request_t;
++
++//This lock protects `badram_remap_req`
++extern spinlock_t badram_remap_req_lock;
++extern badram_remap_request_t badram_remap_req;
++
++
++enum badram_pause_vm_status {
++	BPV_INVALID,
++	BPV_PAUSE_REQUESTED,
++	BPV_PAUSED,
++	BPV_RESUME_REQUESTED,
++	BPV_RESUMED,
++};
++
++typedef struct {
++	//identifies the VM that we want to pause
++	struct kvm* target_kvm;
++	enum badram_pause_vm_status status;
++} badram_pause_vm_t;
++extern badram_pause_vm_t badram_pause_vm;
++extern spinlock_t badram_pause_vm_lock;
++
++#endif
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 585de3a2591e..8fdefb30fa25 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1576,4 +1576,61 @@ struct kvm_create_guest_memfd {
+ 	__u64 reserved[6];
+ };
+ 
++
++//BADRAM IOCTLS
++
++struct kvm_badram_gpa_to_hpa_args {
++	__u64 qemu_pid;
++	__u64 gpa;
++	__u64 out_hpa;
++};
++
++#define KVM_BADRAM_GPA_TO_HPA _IOWR(KVMIO, 0xd5, struct kvm_badram_gpa_to_hpa_args)
++
++struct kvm_badram_flush_tlb_args {
++	__u64 qemupid;
++};
++
++#define KVM_BADRAM_FLUSH_TLB _IOWR(KVMIO, 0xd6, struct kvm_badram_flush_tlb_args)
++
++struct kvm_badram_remap_gfn_args {
++	//gfns of page table entry we want to manipulate
++	uint64_t gfns[2];
++	//new (host) page frame number to which the gfns should point
++	uint64_t new_pfns[2];
++	// pid of the QEMU process running the VM
++	uint64_t qemupid;	
++};
++
++#define KVM_BADRAM_REMAP_GFN _IOWR(KVMIO, 0xd7, struct kvm_badram_remap_gfn_args)
++
++
++struct kvm_badram_get_pt_entry_args {
++	//gpa of page table entry we want to read
++	uint64_t gpa;
++	// pid of the QEMU process running the VM
++	uint64_t qemupid;
++	// page table level we expect/want for gfn. See include/asm/pgtable_types.h
++	uint8_t goal_level;
++	// output paramter filled with page table entry
++	uint64_t out_spte;
++	// output paramter, filled with hpa from out_spte for convenience
++	uint64_t out_hpa;
++};
++
++#define KVM_BADRAM_GET_PT_ENTRY _IOWR(KVMIO, 0xd8, struct kvm_badram_get_pt_entry_args)
++
++struct kvm_badram_pause_vm_args {
++	// pid of the QEMU process running the VM
++	uint64_t qemupid;
++};
++#define KVM_BADRAM_PAUSE_VM _IOWR(KVMIO, 0xd9, struct kvm_badram_pause_vm_args)
++
++struct kvm_badram_resume_vm_args {
++	// pid of the QEMU process running the VM
++	uint64_t qemupid;
++};
++#define KVM_BADRAM_RESUME_VM _IOWR(KVMIO, 0xda, struct kvm_badram_resume_vm_args)
++
++
+ #endif /* __LINUX_KVM_H */
+diff --git a/my-build.sh b/my-build.sh
+new file mode 100755
+index 000000000000..7e7910d22bb5
+--- /dev/null
++++ b/my-build.sh
+@@ -0,0 +1,38 @@
++#!/bin/bash
++
++#abort on first error
++set -e
++
++#We want the version to match the one of the snp kernel, such that
++# modules_install overwrites the existing modules directory with the
++# new versions. This way modprobe will load the new versions.
++# The AMD build scripts sets LOCALVERSION in the config file.
++# If we dont set LOCALVERSION explictly, the build system will a a prefix
++# to the new
++EV=""
++# make clean M=arch/x86/kvm
++make -j $(nproc) LOCALVERSION=${EV} scripts
++make -j $(nproc) LOCALVERSION=${EV} prepare
++make -j $(nproc) LOCALVERSION=${EV} modules_prepare
++make -j $(nproc) LOCALVERSION=${EV} M=arch/x86/kvm
++sudo make LOCALVERSION=${EV} M=arch/x86/kvm modules_install
++
++#This will only export/install the headers meant for usage by userspace
++#Do not write these headers to /lib/modules or /usr/src/linux-headers-*
++#If you build a kernel module, you need to use the stock headers from the kernel installation
++#If you want to build a usperspace program, you will need to include the userspace headers
++#exported in this step
++#make LOCALVERSION=${EV} INSTALL_HDR_PATH=/home/luca/badram/user-headers headers_install
++if [ -z ${UAPI_HDRS_TAR_PATH} ]; then
++  printf "\n\n###\nUAPI_HDRS_TAR_PATH not set. Skipping exporting uapi headers\n###\n\n"
++else
++  printf "\n\n###\nInstalling uapi headers to ${UAPI_HDRS_TAR_PATH}\n###\n\n"
++  TMP_DIR=$(mktemp -d) 
++  make LOCALVERSION=${EV}  INSTALL_HDR_PATH=${TMP_DIR} headers_install
++  tar -czf ${UAPI_HDRS_TAR_PATH} -C ${TMP_DIR} include
++  rm -r ${TMP_DIR}
++fi
++
++printf "\n\n###\nReloading kvm_amd and kvm modules\n###\n\n"
++sudo modprobe -r kvm_amd kvm
++sudo modprobe kvm_amd
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index eb0dfcd157f4..0e0c8edf079d 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -13,6 +13,10 @@
+  *   Yaniv Kamay  <yaniv@qumranet.com>
+  */
+ 
++#include "asm/kvm_host.h"
++#include "linux/badram.h"
++#include "mmu/mmu_internal.h"
++#include "mmu/spte.h"
+ #include <kvm/iodev.h>
+ 
+ #include <linux/kvm_host.h>
+@@ -69,6 +73,9 @@
+ 
+ #include <linux/kvm_dirty_ring.h>
+ 
++//For the BADRAM IOCTLS we need access to the x86 specific
++//VM OPs like TLB flushing
++#include "../../arch/x86/kvm/x86.h"
+ 
+ /* Worst case buffer size needed for holding an integer. */
+ #define ITOA_MAX_LEN 12
+@@ -5466,12 +5473,320 @@ static int kvm_dev_ioctl_create_vm(unsigned long type)
+ 	return r;
+ }
+ 
++
++/**
++	* @brief Looks up the struct kvm for the given qemu pid and returns it
++	* in out_kvm
++	* @returns 0 on success
++**/
++static int qemupid_to_kvm(uint64_t qemupid, struct kvm** out_kvm) {
++	struct kvm* kvm;
++	mutex_lock(&kvm_lock);
++
++	list_for_each_entry(kvm, &vm_list, vm_list) {
++		if( kvm->userspace_pid == qemupid ) {
++			*out_kvm = kvm;
++			mutex_unlock(&kvm_lock);
++			return 0;
++		}
++	}
++	mutex_unlock(&kvm_lock);
++	return -1;
++}
++
+ static long kvm_dev_ioctl(struct file *filp,
+ 			  unsigned int ioctl, unsigned long arg)
+ {
+ 	int r = -EINVAL;
+ 
+ 	switch (ioctl) {
++	case KVM_BADRAM_PAUSE_VM: {
++				struct kvm_badram_pause_vm_args params;
++				struct kvm* kvm;
++				void __user *argp = (void __user *)arg;
++
++				//copy params and locate vm
++				if( copy_from_user(&params, argp, sizeof(params))) {
++					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					return -EINVAL;
++				}
++	
++				if( qemupid_to_kvm(params.qemupid, &kvm)) {
++					printk("%s:%d qemupid_to_kvm failed for qemupid %llu\n", __FILE__, __LINE__, params.qemupid);
++					return -EINVAL;
++				}
++
++				//request vm to stay in paused state on next exit
++				spin_lock(&badram_pause_vm_lock);
++				if( badram_pause_vm.status != BPV_INVALID ) {
++					printk("%s:%d there is already an ongoing pause operation!\n",
++						__FILE__, __LINE__);
++
++					spin_unlock(&badram_pause_vm_lock);
++					return -EINVAL;
++				}
++				badram_pause_vm.target_kvm = kvm;
++				badram_pause_vm.status = BPV_PAUSE_REQUESTED;
++				spin_unlock(&badram_pause_vm_lock);
++				printk("%s:%d requested pause, waiting for ack...\n", __FILE__, __LINE__);
++				//busy wait for next exit to happen
++				while(1) {
++					spin_lock(&badram_pause_vm_lock);
++					if( badram_pause_vm.status == BPV_PAUSED) {
++						spin_unlock(&badram_pause_vm_lock);
++						break;
++					}
++					spin_unlock(&badram_pause_vm_lock);
++				}
++				//if we are here, vm is paused
++				
++				r = 0;			
++				printk("%s:%d pause ictol succeeded\n", __FILE__, __LINE__);
++			}
++			break;
++	case KVM_BADRAM_RESUME_VM: {
++				struct kvm_badram_resume_vm_args params;
++				struct kvm* kvm;
++				void __user *argp = (void __user *)arg;
++
++				//copy params and locate vm
++				if( copy_from_user(&params, argp, sizeof(params))) {
++					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					return -EINVAL;
++				}
++	
++				if( qemupid_to_kvm(params.qemupid, &kvm)) {
++					printk("%s:%d qemupid_to_kvm failed for qemupid %llu\n", __FILE__, __LINE__, params.qemupid);
++					return -EINVAL;
++				}
++
++				//request vm to resume
++				spin_lock(&badram_pause_vm_lock);
++				if( badram_pause_vm.status != BPV_PAUSED ) {
++					printk("%s:%d the VM not in paused state\n",
++						__FILE__, __LINE__);
++
++					spin_unlock(&badram_pause_vm_lock);
++					return -EINVAL;
++				}
++				if( badram_pause_vm.target_kvm != kvm) {
++					printk("%s:%d the previous pause request was for a different VM\n",
++						__FILE__, __LINE__);
++
++					spin_unlock(&badram_pause_vm_lock);
++					return -EINVAL;
++				}
++				badram_pause_vm.status = BPV_RESUME_REQUESTED;
++				spin_unlock(&badram_pause_vm_lock);
++				printk("%s:%d Requested resume, waiting for ack...\n", __FILE__, __LINE__);
++
++				//busy wait for resume to happen
++				while(1) {
++					spin_lock(&badram_pause_vm_lock);
++					if( badram_pause_vm.status == BPV_RESUMED) {
++						badram_pause_vm.status = BPV_INVALID;
++						badram_pause_vm.target_kvm = NULL;
++						spin_unlock(&badram_pause_vm_lock);
++						break;
++					}
++					spin_unlock(&badram_pause_vm_lock);
++				}
++				//if we are here, vm is paused
++				
++				printk("%s:%d resume ictol succeeded\n", __FILE__, __LINE__);
++				r = 0;			
++			}
++			break;
++	case KVM_BADRAM_GET_PT_ENTRY: {
++				struct kvm_badram_get_pt_entry_args params;
++				struct kvm* kvm;
++				struct kvm_vcpu* vcpu;
++				void __user *argp = (void __user *)arg;
++
++				if( copy_from_user(&params, argp, sizeof(params))) {
++					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					return -EINVAL;
++				}
++	
++				if( qemupid_to_kvm(params.qemupid, &kvm)) {
++					printk("%s:%d qemupid_to_kvm failed for qemupid %llu\n", __FILE__, __LINE__, params.qemupid);
++					return -EINVAL;
++				}
++				vcpu = xa_load(&kvm->vcpu_array, 0);
++
++				if( badram_get_spte(vcpu, params.gpa , params.goal_level , &params.out_spte )) {
++					printk("%s:%d badram_get_spte failed\n", __FILE__, __LINE__);
++					return -EINVAL;
++				}
++				params.out_hpa = params.out_spte & SPTE_BASE_ADDR_MASK;
++
++				if( copy_to_user(argp, &params, sizeof(params))) {
++						printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++						return -EINVAL;
++				}
++				r = 0;
++			}
++			break;
++	case KVM_BADRAM_REMAP_GFN: {
++				struct kvm_badram_remap_gfn_args params;
++				struct kvm* kvm;
++				struct kvm_vcpu* vcpu;
++				struct kvm_memory_slot* memslots[2];
++				int idx;
++				bool is_tdp, have_nx_workaround;
++				void __user *argp = (void __user *)arg;
++
++				if( copy_from_user(&params, argp, sizeof(params))) {
++					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					return -EINVAL;
++				}
++
++				
++				if( qemupid_to_kvm(params.qemupid, &kvm)) {
++					printk("%s:%d qemupid_to_kvm failed for qemupid %llu\n", __FILE__, __LINE__, params.qemupid);
++					return -EINVAL;
++				}
++				vcpu = xa_load(&kvm->vcpu_array, 0);
++
++				//query some additional values required for remap reqauest
++				is_tdp = vcpu->arch.mmu->page_fault == kvm_tdp_page_fault;
++				printk("%s:%d is_tdp=%d\n", __FILE__, __LINE__, is_tdp);
++				have_nx_workaround = is_nx_huge_page_enabled(kvm);
++				for(idx = 0; idx < sizeof(params.gfns)/sizeof(params.gfns[0]); idx++) {	
++					memslots[idx] = kvm_vcpu_gfn_to_memslot(vcpu, params.gfns[idx] );
++					if (!memslots[idx] || memslots[idx]->flags & KVM_MEMSLOT_INVALID) {
++						printk("%s:%d error getting memslot for gfn 0x%llx\n", __FILE__, __LINE__, params.gfns[idx]);
++						return -EINVAL;
++					}
++				}
++
++				printk("%s:%d taking lock and writing config\n", __FILE__, __LINE__);
++				//create remap request. Will be processed on next VMEXIT
++				spin_lock(&badram_remap_req_lock);
++				memcpy(badram_remap_req.gfns, params.gfns, sizeof(params.gfns));
++				memcpy(badram_remap_req.new_pfns, params.new_pfns, sizeof(params.new_pfns));
++				badram_remap_req.target_kvm = kvm;
++				badram_remap_req.is_tdp = is_tdp;
++				badram_remap_req.have_hp_nx_workaround = have_nx_workaround;
++				memcpy(badram_remap_req.slots, memslots, sizeof(memslots));
++				badram_remap_req.pending = true;
++				spin_unlock(&badram_remap_req_lock);
++
++				r = 0;
++		}
++		break;
++	case KVM_BADRAM_FLUSH_TLB: {
++				struct kvm_badram_flush_tlb_args params;
++				struct kvm* kvm;
++				struct kvm_vcpu* vcpu;
++				unsigned long vcpu_idx;
++				
++				void __user *argp = (void __user *)arg;
++
++
++				if( copy_from_user(&params, argp, sizeof(params))) {
++					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					return -EINVAL;
++				}
++
++				if( qemupid_to_kvm(params.qemupid, &kvm)) {
++					printk("%s:%d qemupid_to_kvm failed for qemupid %llu\n", __FILE__, __LINE__, params.qemupid);
++					return -EINVAL;
++				}
++
++
++				//request tlb flush for each vcpu
++				xa_for_each(&(kvm->vcpu_array), vcpu_idx, vcpu) {
++					kvm_service_local_tlb_flush_requests(vcpu);
++				}
++				//TODO: how do we ensure that flush is actually executed (i.e. vmexit/entry cycle)
++				//has occured?
++
++				r =0;
++			}
++			break;
++	case KVM_BADRAM_GPA_TO_HPA: {
++			struct kvm_badram_gpa_to_hpa_args params;
++			struct kvm* kvm;
++			struct kvm* target_kvm = NULL;
++			gfn_t gfn;
++			kvm_pfn_t pfn;
++			uint64_t offset;
++			struct kvm_memory_slot* memslot;
++			void __user *argp = (void __user *)arg;
++
++			if( copy_from_user(&params, argp, sizeof(params))) {
++					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					return -EINVAL;
++			}
++			//Lookup struct kvm for the given qemu pid
++			//printk("%s: iterating over vm_list\n", __FUNCTION__);
++			mutex_lock(&kvm_lock);
++			list_for_each_entry(kvm, &vm_list, vm_list) {
++				//printk("kvm->userspace_pid = %u\n", kvm->userspace_pid);
++				if( kvm->userspace_pid == params.qemu_pid ) {
++						target_kvm = kvm;
++				}
++			}
++			mutex_unlock(&kvm_lock);
++			if( target_kvm == NULL ) {
++					printk("%s:%d did not find kvm with pid %llu\n", __FILE__, __LINE__, params.qemu_pid);
++					return -EINVAL;
++			}
++
++			//Two paths
++			// Path 1): SEV-SNP VM with MEMFD backed RAM
++			// Path 2) All others
++
++			
++			offset = params.gpa & 0xfff;
++			gfn = params.gpa >> 12;
++			memslot = gfn_to_memslot(target_kvm, gfn);
++			//Path 1
++			if(  kvm_slot_can_be_private(memslot)) {
++				int order;
++				if( kvm_gmem_get_pfn(target_kvm, memslot, gfn, &pfn, &order) ) {
++						printk("%s:%d kvm_gmem_get_pfn failed\n", __FILE__, __LINE__);
++						return -EINVAL;
++				}
++				if( is_error_pfn(pfn)) {
++						printk("%s:%d kvm_gmem_get_pfn returned bad pfn 0x%llx\n", __FILE__, __LINE__, pfn);
++						return -EINVAL;	
++				}
++			} else { //Path 2
++					struct page* page;
++					int locked;
++					struct kvm_vcpu* vcpu = xa_load(&target_kvm->vcpu_array, 0);
++					uint64_t hva = kvm_vcpu_gfn_to_hva(vcpu , gfn);
++
++					mmap_read_lock(target_kvm->mm);
++					locked = 1;
++					if( pin_user_pages_remote(target_kvm->mm, hva, 1, 0, &page, &locked) != 1) {
++						printk("%s:%d: get_user_pages_remote_unlocked for failed\n", __FILE__, __LINE__);
++						mmap_read_unlock(target_kvm->mm);
++						return -EINVAL;
++					}
++					mmap_read_unlock(target_kvm->mm);
++
++					pfn = page_to_pfn(page);
++					unpin_user_pages(&page, 1);
++
++					if( is_error_pfn(pfn)) {
++						printk("%s: got error pfn using regular path\n", __FUNCTION__);
++						return -EINVAL;		
++					}
++			}
++
++			params.out_hpa = (pfn << 12 ) | offset;
++			printk("%s:%d out_hpa=0x%llx\n", __FILE__, __LINE__, params.out_hpa);
++
++			if( copy_to_user(argp, &params, sizeof(params))) {
++					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					return -EINVAL;
++			}
++			r = 0;
++		}
++		break;
+ 	case KVM_GET_API_VERSION:
+ 		if (arg)
+ 			goto out;
+-- 
+2.34.1
+

@@ -1,0 +1,1 @@
+The patches were applied against commit cc2568386ccb5b0d7a46b35dc2fad3412d3aad26 of branch snp-host-latest of the https://github.com/AMDESE/linux.git repo.

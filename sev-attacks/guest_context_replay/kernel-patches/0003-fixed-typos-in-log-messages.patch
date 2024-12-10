@@ -1,0 +1,52 @@
+From 047c0971303ad34abc333304a8f3289b88125c1b Mon Sep 17 00:00:00 2001
+From: Luca Wilke <l.wilke@uni-luebeck.de>
+Date: Tue, 2 Apr 2024 08:11:49 +0200
+Subject: [PATCH 3/4] fixed typos in log messages
+
+---
+ virt/kvm/kvm_main.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 0e0c8edf079d..6ca8acb801c3 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -5507,7 +5507,7 @@ static long kvm_dev_ioctl(struct file *filp,
+ 
+ 				//copy params and locate vm
+ 				if( copy_from_user(&params, argp, sizeof(params))) {
+-					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					printk("%s:%d copy_from_user failed\n", __FILE__, __LINE__);
+ 					return -EINVAL;
+ 				}
+ 	
+@@ -5541,7 +5541,7 @@ static long kvm_dev_ioctl(struct file *filp,
+ 				//if we are here, vm is paused
+ 				
+ 				r = 0;			
+-				printk("%s:%d pause ictol succeeded\n", __FILE__, __LINE__);
++				printk("%s:%d pause ioctl succeeded\n", __FILE__, __LINE__);
+ 			}
+ 			break;
+ 	case KVM_BADRAM_RESUME_VM: {
+@@ -5551,7 +5551,7 @@ static long kvm_dev_ioctl(struct file *filp,
+ 
+ 				//copy params and locate vm
+ 				if( copy_from_user(&params, argp, sizeof(params))) {
+-					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					printk("%s:%d copy_from_user failed\n", __FILE__, __LINE__);
+ 					return -EINVAL;
+ 				}
+ 	
+@@ -5604,7 +5604,7 @@ static long kvm_dev_ioctl(struct file *filp,
+ 				void __user *argp = (void __user *)arg;
+ 
+ 				if( copy_from_user(&params, argp, sizeof(params))) {
+-					printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++					printk("%s:%d copy_from_user failed\n", __FILE__, __LINE__);
+ 					return -EINVAL;
+ 				}
+ 	
+-- 
+2.34.1
+

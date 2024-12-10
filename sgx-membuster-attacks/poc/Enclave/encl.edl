@@ -1,0 +1,11 @@
+enclave {
+	
+	trusted {
+        public void  initialize_buffer( void );
+        public void  write_to_buffer(int offset);
+        public void  *get_buffer_addr( void );
+	};
+	
+	untrusted {
+	};
+};

