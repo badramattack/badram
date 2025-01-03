@@ -6,7 +6,7 @@ This repository contains the scripts and tools to perform BadRAM attacks, as wel
 
 * `common-code` contains a static library with helper functions that are used throughout this project.
 * `alias-reversing` contains kernel modules and userspace tools for reversing the alias memory mapping.
-  * `alias-reversing/modules/read_alias` offers a generic read/write to physical memory API and builds a static libs used by other code parts.
+  * `alias-reversing/modules/read_alias` offers a generic read/write to physical memory API and builds a static library used by other code parts.
   * `alias-reversing/apps/find-alias-individual` is a smart tool to reverse the aliasing. Checks each memory region individually, as they do not always have the same aliasing function. Results are exported as csv and and be read/written with the tools in `common-code`.
   * `alias-reversing/apps/test-alias` takes the aliases exported by `find-alias-individual` and checks that they apply for each address of the corresponding memory range. May lead to crashes if the aliased memory is used by the system.
 * `scripts` provides the Raspberry Pi Pico scripts to read, unlock, and overwrite the SPD data for DDR4 (ee1004) and DDR5 (spd5118).
@@ -118,14 +118,14 @@ To prevent accidental overwrites, the use of the aliased region can be prevented
 ```
 memmap=nn$ss
 ```
-This will mark region `ss` to `ss+nn` as reserved. Note that using this parameter in GRUB requires escaping the `$` ad `\$`. If you enter it through `/etc/default/grub`, you also have to escape the `\`:
+This will mark region `ss` to `ss+nn` as reserved. Note that using this parameter in GRUB requires escaping the `$` as `\$`. If you enter it through `/etc/default/grub`, you also have to escape the `\`:
 ```
 GRUB_CMDLINE_LINUX_DEFAULT="memmap=nn\\\$ss"
 ```
 
 ### Finding aliases
 
-You can use `find-alias-individual` to find the aliases for each memory region on you system. This tool will produce an `aliases.csv` file, which can be later used to find the alias of any address on your machine.
+You can use `find-alias-individual` to find the aliases for each memory region on your system. This tool will produce an `aliases.csv` file, which can be later used to find the alias of any address on your machine.
 
 ## Cite
 
