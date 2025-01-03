@@ -8,12 +8,13 @@ INCS = $(wildcard *.h $(foreach fd, $(SUBDIR), $(fd)/*.h))
 SRCS = $(wildcard *.c $(foreach fd, $(SUBDIR), $(fd)/*.c))
 
 #libcommon.a
-LIBCOMMON= ../../common-code/
+LIBCOMMON= ../../common-code
 #lib kmod_read_alias.a
-LIBKRA = ../../alias-reversing/modules/read_alias/
+LIBKRA = ../../alias-reversing/modules/read_alias
 
 
-INCLUDES=  -I$(LIBCOMMON)/include -I$(LIBKRA)/include LIBS = -L$(LIBCOMMON)/build/libs -L$(LIBKRA)
+INCLUDES=  -I$(LIBCOMMON)/include -I$(LIBKRA)/include
+LIBS = -L$(LIBCOMMON)/build/libs -L$(LIBKRA)
 
 all: setup-dirs $(BIN_DIR)/badram-vm-victim $(BIN_DIR)/badram-sev-replay
 .PHONY: clean setup-dirs

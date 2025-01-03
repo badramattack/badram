@@ -6,12 +6,11 @@ This folder contains proof-of-concept code for a simple ciphertext replay on SEV
 To work with recent SEV-SNP software stacks, this requires you to follow the README in `../gpa2hpa-kernel-patches` to apply the GPA2HPA KVM patch to your kernel. You will only need to rebuild the KVM module, not the whole kernel. The folder contains a README with more instructions.
 
 Afterwards, you can build the attack code as follows:
-1) Set and export `KERNEL_PATCH_UAPI` to the uapi header files exported while building the GPA2HPA patched KVM module
+1) Set and export `KERNEL_PATH_UAPI` to the uapi header files exported while building the GPA2HPA patched KVM module
 2) If you don't execute this on the targeted machine, set and export `KERNEL_PATH` to point to the kernel headers of the targeted kernel. Otherwise, the headers for the currently running kernel will be used.  
 3) Build everything with `make`.
 
 This will build 3 artifacts
-- ``
 - `./build/binaries/badram-vm-victim`
 - `./build/binaries/badram-sev-reply`
 - `../../alias-reversing/modules/read_alias/kmod_readalias.ko`
@@ -19,7 +18,7 @@ This will build 3 artifacts
 
 ## Use
 
-We assume that you know the aliasing function for the manipulated DIMM. You can use the `fai` tool from `alias-reversing/apps/find-alias-individual` to get this function. Besides printing the results to the command line, it will also create the `aliases.csv` file which can ben used with this attack tool.
+We assume that you know the aliasing function for the manipulated DIMM. You can use the `fai` tool from `alias-reversing/apps/find-alias-individual` to get this function. Besides printing the results to the command line, it will also create the `aliases.csv` file, which can be used with this attack tool.
 
 If you don't use the `fai` tool, you can also manually create the `aliases.csv` file. The format is as follows
 ```csv

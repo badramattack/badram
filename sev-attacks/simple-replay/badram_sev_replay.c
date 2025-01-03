@@ -34,7 +34,7 @@ int main(int argc, char** argv) {
     //
     if(argc != 5 ) {
         printf("Params:  <qemu pid>  <path to alias definition csv> <{gpa2hpa_qemu,gpa2hpa_kern}><target victim gpa in hex>\n");
-        printf("For SEV-SNP with memfd, only gpa2kern produces correct results\n")
+        printf("For SEV-SNP with memfd, only gpa2hpa_kern produces correct results\n");
         return 0;
     }
     uint64_t qemu_pid;
