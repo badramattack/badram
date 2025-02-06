@@ -1,2 +1,2 @@
-Thes patches where applied against commit f246dd2ad51d2c6c3ce9a588a8ce9c6a2d8c20e1 of branch snp-latest of https://github.com/AMDESE/qemu.git
+These patches where applied against commit f246dd2ad51d2c6c3ce9a588a8ce9c6a2d8c20e1 of branch snp-latest of https://github.com/AMDESE/qemu.git
 

@@ -890,7 +890,7 @@ int mode_find(struct cli_flags flags) {
     }
 
     //Search alias for each source_pa
-    uint64_t* alias_pa = calloc(sizeof(uint64_t), source_candidates_len);
+    uint64_t* alias_pa = calloc(source_candidates_len, sizeof(uint64_t));
     for( size_t i = 0; i < source_candidates_len; i++) {
         printf("[%ju/%ju[: Searching alias for 0x%jx\n", i, source_candidates_len, source_candidates[i].pa);
         //First check if any of the already found alias shifts work

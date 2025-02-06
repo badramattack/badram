@@ -4,4 +4,4 @@ A kernel module that allows direct read/write access to physical memory. See `./
 
 See `common-code` for loading/storing and calculating aliased addresses.
 
-If you want to build the kernel module for a kernel different from the currently running one, set the `KERNEL_PATH` environment variable the the header files of the targeted kernel.
+If you want to build the kernel module for a kernel different from the currently running one, set the `KERNEL_PATH` environment variable to the header files of the targeted kernel.

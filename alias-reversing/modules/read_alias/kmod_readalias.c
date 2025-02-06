@@ -4,6 +4,7 @@
 #include <linux/module.h>
 #include <linux/version.h>
 #include <linux/io.h>
+#include <linux/vmalloc.h>
 
 #include "include/readalias_ioctls.h"
 
