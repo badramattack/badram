@@ -179,7 +179,7 @@ int memcpy_frompa_ext(void* dst, uint64_t src, size_t count, struct pamemcpy_cfg
     cfg->err_on_access_fail , cfg->access_reserved );
 }
 
-int clflush_range(uint64_t pa, size_t count, page_stats_t* out_stats, bool err_on_access_fail) {
+int __clflush_range(uint64_t pa, size_t count, page_stats_t* out_stats, bool err_on_access_fail, bool access_reserved) {
   if (kmod_fd < 0) {
     printf("%s:%d: driver not openened\n", __FILE__, __LINE__);
     return -1;
@@ -187,6 +187,7 @@ int clflush_range(uint64_t pa, size_t count, page_stats_t* out_stats, bool err_o
 
   struct args args = {
     .pa = pa,
+    .access_reserved = access_reserved,
   };
 
   size_t remaining = count;
@@ -220,13 +221,16 @@ int clflush_range(uint64_t pa, size_t count, page_stats_t* out_stats, bool err_o
   return 0;
 }
 
+int clflush_range(uint64_t pa, size_t count, page_stats_t* out_stats, bool err_on_access_fail) {
+  return __clflush_range(pa, count, out_stats, err_on_access_fail, false);
+}
 
 int flush_ext(uint64_t pa, size_t count, struct pamemcpy_cfg* cfg) {
   switch(cfg->flush_method) {
     case FM_NONE:
       return 0;
     case FM_CLFLUSH:
-      return clflush_range(pa, count, &(cfg->out_stats), cfg->err_on_access_fail);
+      return __clflush_range(pa, count, &(cfg->out_stats), cfg->err_on_access_fail, cfg->access_reserved);
     case FM_WBINVD:
       return wbinvd_ac();
     default:
