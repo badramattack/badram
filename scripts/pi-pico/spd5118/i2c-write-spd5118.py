@@ -30,6 +30,15 @@ if mr12 == 0 and mr13 == 0:
 else:
     print(f"SPD is protected: mr12={mr12:#04x}, mr13={mr13:#04x}")
     print("Unlocking SPD... ", end="")
+
+    # Check if HSA is tied to ground
+    mr48 = i2c.readfrom_mem(0x50, 0x30, 1)
+    if mr48[0] >> 2 & 1 == 0:
+        print("unable to unlock SPD")
+        print("Write protection overwrite disabled. Check if HSA is tied to GND.")
+        print("Try manually resetting the SPD by reconnecting VIN while leaving HSA conencted to GND.")
+        raise Exception("Write protection overwrite not enabled.")
+
     # Set MR12 and MR13 to zero, disabling the write protection
     i2c.writeto_mem(0x50, 0xc, b"\x00")  # MR12
     i2c.writeto_mem(0x50, 0xd, b"\x00")  # MR13
