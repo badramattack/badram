@@ -157,7 +157,7 @@ static char args_doc[] = "--aliases [--verbose] [--access-reserved]";
 static struct argp_option options[] = {
 	{"verbose", 1, 0, 0, "Verbose output", 0},
 	{"access-reserved", 2, 0, 0, "Allow accessing reserved memory ranges. Might lead to crashes\n", 0},
-	{"aliases", 3, 0, 0, "CSV file (same syntax as fai tool output) that specifies the memory ranges and alias functions\n", 0},
+	{"aliases", 3, "FILE", 0, "CSV file (same syntax as fai tool output) that specifies the memory ranges and alias functions\n", 0},
 	{0},
 };
 
