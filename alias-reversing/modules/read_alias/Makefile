@@ -1,4 +1,4 @@
-all: setup-dirs kmod_readalias.ko libkmodreadlias.a 
+all: setup-dirs kmod_readalias.ko libkmodreadalias.a 
 .PHONY: clean setup-dirs
 
 CFLAGS= -O3 -std=gnu11 -Wall -Wextra -Wpedantic -Werror
@@ -15,7 +15,7 @@ obj-m += kmod_readalias.o
 kmod_readalias.ko: kmod_readalias.c
 	make -C $(KERNEL_PATH) M=$(PWD) modules
 
-libkmodreadlias.a: readalias.c
+libkmodreadalias.a: readalias.c
 	gcc $(CFLAGS) -o readalias.o -c readalias.c
 	ar rcs libkmodreadalias.a readalias.o
 clean:
